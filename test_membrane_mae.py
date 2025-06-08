@@ -271,12 +271,9 @@ def main(args):
     
     # Compile model for better performance (PyTorch 2.0+)
     # No fallback: if compilation fails, the job should fail.
-    if hasattr(torch, 'compile'):
-        print("Compiling model with torch.compile for improved performance...")
-        model = torch.compile(model, mode='default')
-        print("Model compilation successful.")
-    else:
-        print("Warning: torch.compile not available. Continuing without compilation.")
+    print("Compiling model with torch.compile for improved performance...")
+    model = torch.compile(model, mode='default')
+    print("Model compilation successful.")
     
     wandb.watch(model, log_freq=100)
     # Optimizer now uses learning rate from args
