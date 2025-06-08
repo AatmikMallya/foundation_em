@@ -1,548 +1,394 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
+from functools import partial
 import math
-from typing import Tuple, Optional, Union
-import platform
 
-class PatchEmbedding3D(nn.Module):
-    """3D patch embedding for converting voxel volumes to patches."""
-    
-    def __init__(self, volume_size: Tuple[int, int, int] = (64, 64, 64), 
-                 patch_size: Tuple[int, int, int] = (8, 8, 8),
-                 in_channels: int = 1, 
-                 embed_dim: int = 768):
-        super().__init__()
-        self.volume_size = volume_size
-        self.patch_size = patch_size
-        self.in_channels = in_channels
-        self.embed_dim = embed_dim
-        
-        # Calculate number of patches per dimension
-        self.num_patches_d = volume_size[0] // patch_size[0]
-        self.num_patches_h = volume_size[1] // patch_size[1]
-        self.num_patches_w = volume_size[2] // patch_size[2]
-        self.num_patches = self.num_patches_d * self.num_patches_h * self.num_patches_w
-        
-        # Patch projection via 3D convolution
-        self.projection = nn.Conv3d(
-            in_channels, embed_dim, 
-            kernel_size=patch_size, 
-            stride=patch_size
-        )
-        
-    def forward(self, x):
-        """
-        Args:
-            x: Input tensor of shape (B, C, D, H, W)
-        Returns:
-            Patches of shape (B, num_patches, embed_dim)
-        """
-        B, C, D, H, W = x.shape
-        
-        # Project to patches
-        x = self.projection(x)  # (B, embed_dim, num_patches_d, num_patches_h, num_patches_w)
-        
-        # Flatten spatial dimensions
-        x = x.flatten(2)  # (B, embed_dim, num_patches)
-        x = x.transpose(1, 2)  # (B, num_patches, embed_dim)
-        
+# Helper to make sure inputs are 3-tuples
+def to_3tuple(x):
+    if isinstance(x, tuple) and len(x) == 3:
         return x
+    return (x, x, x)
 
-class PositionalEncoding3D(nn.Module):
-    """3D positional encoding for voxel patches."""
-    
-    def __init__(self, embed_dim: int, num_patches_d: int, num_patches_h: int, num_patches_w: int):
-        super().__init__()
-        self.embed_dim = embed_dim
-        self.num_patches_d = num_patches_d
-        self.num_patches_h = num_patches_h
-        self.num_patches_w = num_patches_w
-        
-        # Create learnable positional embeddings
-        num_patches = num_patches_d * num_patches_h * num_patches_w
-        self.pos_embedding = nn.Parameter(torch.randn(1, num_patches, embed_dim) * 0.02)
-        
-    def forward(self, x):
-        """Add positional encoding to patch embeddings."""
-        return x + self.pos_embedding
+def get_device():
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-class MultiHeadAttention3D(nn.Module):
-    """Multi-head self attention for 3D patches."""
-    
-    def __init__(self, embed_dim: int = 768, num_heads: int = 12, dropout: float = 0.1):
-        super().__init__()
-        self.embed_dim = embed_dim
-        self.num_heads = num_heads
-        self.head_dim = embed_dim // num_heads
-        self.scale = self.head_dim ** -0.5
-        
-        assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
-        
-        self.qkv = nn.Linear(embed_dim, embed_dim * 3)
-        self.attn_dropout = nn.Dropout(dropout)
-        self.proj = nn.Linear(embed_dim, embed_dim)
-        self.proj_dropout = nn.Dropout(dropout)
-        
-    def forward(self, x):
-        B, N, C = x.shape
-        
-        # Generate Q, K, V
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
-        
-        # Attention computation
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = F.softmax(attn, dim=-1)
-        attn = self.attn_dropout(attn)
-        
-        # Apply attention to values
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
-        x = self.proj(x)
-        x = self.proj_dropout(x)
-        
+def drop_path(x, drop_prob: float = 0., training: bool = False):
+    if drop_prob == 0. or not training:
         return x
+    keep_prob = 1 - drop_prob
+    shape = (x.shape[0],) + (1,) * (x.ndim - 1)  # work with diff dim tensors, not just 2D ConvNets
+    random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+    random_tensor.floor_()  # binarize
+    output = x.div(keep_prob) * random_tensor
+    return output
 
-class MLP(nn.Module):
-    """MLP block for Transformer."""
-    
-    def __init__(self, embed_dim: int = 768, mlp_ratio: float = 4.0, dropout: float = 0.1):
+class DropPath(nn.Module):
+    """Drop paths (Stochastic Depth) per sample  (when applied in main path of residual blocks).
+    """
+    def __init__(self, drop_prob=None):
+        super(DropPath, self).__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x):
+        return drop_path(x, self.drop_prob, self.training)
+
+class Mlp(nn.Module):
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
         super().__init__()
-        hidden_dim = int(embed_dim * mlp_ratio)
-        
-        self.fc1 = nn.Linear(embed_dim, hidden_dim)
-        self.act = nn.GELU()
-        self.fc2 = nn.Linear(hidden_dim, embed_dim)
-        self.dropout = nn.Dropout(dropout)
-        
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.act = act_layer()
+        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.drop = nn.Dropout(drop)
+
     def forward(self, x):
         x = self.fc1(x)
         x = self.act(x)
-        x = self.dropout(x)
+        x = self.drop(x)
         x = self.fc2(x)
-        x = self.dropout(x)
+        x = self.drop(x)
         return x
 
-class TransformerBlock(nn.Module):
-    """Transformer encoder block."""
-    
-    def __init__(self, embed_dim: int = 768, num_heads: int = 12, 
-                 mlp_ratio: float = 4.0, dropout: float = 0.1):
+class Attention(nn.Module):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.):
         super().__init__()
-        
-        self.norm1 = nn.LayerNorm(embed_dim)
-        self.attn = MultiHeadAttention3D(embed_dim, num_heads, dropout)
-        self.norm2 = nn.LayerNorm(embed_dim)
-        self.mlp = MLP(embed_dim, mlp_ratio, dropout)
-        
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = qk_scale or head_dim ** -0.5
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
     def forward(self, x):
-        # Self-attention with residual connection
-        x = x + self.attn(self.norm1(x))
-        # MLP with residual connection
-        x = x + self.mlp(self.norm2(x))
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
         return x
 
-class ViT3D(nn.Module):
-    """3D Vision Transformer for EM voxel data."""
-    
-    def __init__(self, 
-                 volume_size: Tuple[int, int, int] = (64, 64, 64),
-                 patch_size: Tuple[int, int, int] = (8, 8, 8),
-                 in_channels: int = 1,
-                 embed_dim: int = 768,
-                 depth: int = 12,
-                 num_heads: int = 12,
-                 mlp_ratio: float = 4.0,
-                 dropout: float = 0.1,
-                 num_classes: int = 1000):  # For classification head if needed
+class Block(nn.Module):
+    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
+                 drop_path_ratio=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
         super().__init__()
-        
+        self.norm1 = norm_layer(dim)
+        self.attn = Attention(
+            dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
+        self.drop_path = DropPath(drop_path_ratio) if drop_path_ratio > 0. else nn.Identity()
+        self.norm2 = norm_layer(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
+
+    def forward(self, x):
+        x = x + self.drop_path(self.attn(self.norm1(x)))
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        return x
+
+class PatchEmbed3D(nn.Module):
+    """ 3D Image to Patch Embedding
+    """
+    def __init__(self, volume_size=(64, 64, 64), patch_size=(8, 8, 8), in_chans=1, embed_dim=768):
+        super().__init__()
+        volume_size = to_3tuple(volume_size)
+        patch_size = to_3tuple(patch_size)
         self.volume_size = volume_size
         self.patch_size = patch_size
+        self.grid_size = (volume_size[0] // patch_size[0], volume_size[1] // patch_size[1], volume_size[2] // patch_size[2])
+        self.num_patches = self.grid_size[0] * self.grid_size[1] * self.grid_size[2]
+
+        self.proj = nn.Conv3d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+
+    def forward(self, x):
+        B, C, D, H, W = x.shape
+        assert D == self.volume_size[0] and H == self.volume_size[1] and W == self.volume_size[2], \
+            f"Input image size ({D},{H},{W}) doesn't match model ({self.volume_size[0]},{self.volume_size[1]},{self.volume_size[2]})."
+        x = self.proj(x).flatten(2).transpose(1, 2) # B, C, Dp, Hp, Wp -> B, C, Np -> B, Np, C
+        return x
+
+def get_sinusoid_encoding_table_3d(num_patches, embed_dim):
+    """
+    3D Sinusoidal Positional Encoding Table
+    """
+    grid_size_float = num_patches**(1/3)
+    grid_size = int(round(grid_size_float))
+    if abs(grid_size_float - grid_size) > 1e-6 or grid_size**3 != num_patches :
+        raise ValueError(f"Number of patches ({num_patches}) must be a perfect cube for 3D sinusoidal encoding.")
+
+    sinusoid_table = torch.zeros(num_patches, embed_dim)
+    
+    grid_d_coords = torch.arange(grid_size, dtype=torch.float32).unsqueeze(-1).unsqueeze(-1).expand(-1, grid_size, grid_size)
+    grid_h_coords = torch.arange(grid_size, dtype=torch.float32).unsqueeze(0).unsqueeze(-1).expand(grid_size, -1, grid_size)
+    grid_w_coords = torch.arange(grid_size, dtype=torch.float32).unsqueeze(0).unsqueeze(0).expand(grid_size, grid_size, -1)
+
+    grid_d = grid_d_coords.flatten()
+    grid_h = grid_h_coords.flatten()
+    grid_w = grid_w_coords.flatten()
+
+    emb_d = torch.zeros(num_patches, embed_dim)
+    emb_h = torch.zeros(num_patches, embed_dim)
+    emb_w = torch.zeros(num_patches, embed_dim)
+
+    div_term = torch.exp(torch.arange(0, embed_dim, 2).float() * (-math.log(10000.0) / embed_dim))
+
+    emb_d[:, 0::2] = torch.sin(grid_d[:, None] * div_term)
+    emb_d[:, 1::2] = torch.cos(grid_d[:, None] * div_term)
+
+    emb_h[:, 0::2] = torch.sin(grid_h[:, None] * div_term)
+    emb_h[:, 1::2] = torch.cos(grid_h[:, None] * div_term)
+
+    emb_w[:, 0::2] = torch.sin(grid_w[:, None] * div_term)
+    emb_w[:, 1::2] = torch.cos(grid_w[:, None] * div_term)
+
+    sinusoid_table = emb_d + emb_h + emb_w # Summing the positional encodings
+    return sinusoid_table
+
+class ViT3D(nn.Module):
+    """ Vision Transformer for 3D data """
+    def __init__(self, volume_size=(64,64,64), patch_size=(8,8,8), in_chans=1, num_classes=0, # num_classes=0 for MAE encoder
+                 embed_dim=768, depth=12, num_heads=12, mlp_ratio=4., qkv_bias=True, 
+                 drop_rate=0., attn_drop_rate=0., drop_path_rate=0., norm_layer=None,
+                 global_pool=False):
+        super().__init__()
+        self.num_classes = num_classes
         self.embed_dim = embed_dim
-        self.depth = depth
-        
-        # Patch embedding
-        self.patch_embed = PatchEmbedding3D(volume_size, patch_size, in_channels, embed_dim)
+        self.global_pool = global_pool
+        self.patch_size = to_3tuple(patch_size)
+
+        self.patch_embed = PatchEmbed3D(volume_size, self.patch_size, in_chans, embed_dim)
         num_patches = self.patch_embed.num_patches
-        
-        # Positional encoding
-        self.pos_embed = PositionalEncoding3D(
-            embed_dim, 
-            self.patch_embed.num_patches_d,
-            self.patch_embed.num_patches_h, 
-            self.patch_embed.num_patches_w
-        )
-        
-        # Class token (optional, useful for classification tasks)
-        self.cls_token = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
-        
-        # Transformer blocks
+
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim), requires_grad=True)
+
+        norm_layer = norm_layer or partial(nn.LayerNorm, eps=1e-6)
+
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
         self.blocks = nn.ModuleList([
-            TransformerBlock(embed_dim, num_heads, mlp_ratio, dropout)
-            for _ in range(depth)
-        ])
-        
-        # Layer norm
-        self.norm = nn.LayerNorm(embed_dim)
-        
-        # Classification head (optional)
+            Block(
+                dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias,
+                drop=drop_rate, attn_drop=attn_drop_rate, drop_path_ratio=dpr[i], norm_layer=norm_layer)
+            for i in range(depth)])
+        self.norm = norm_layer(embed_dim)
+
+        # Classifier head
         self.head = nn.Linear(embed_dim, num_classes) if num_classes > 0 else nn.Identity()
-        
-        # Dropout
-        self.dropout = nn.Dropout(dropout)
-        
-        # Initialize weights
-        self.apply(self._init_weights)
-        
-    def _init_weights(self, m):
+
+        self.init_weights()
+
+    def init_weights(self):
+        # Initialize positional embedding with truncated normal, as is standard for learnable embeddings
+        torch.nn.init.trunc_normal_(self.pos_embed, std=.02)
+        torch.nn.init.normal_(self.cls_token, std=.02)
+        self.apply(self._init_weights_linear_layernorm)
+    
+    def _init_weights_linear_layernorm(self, m):
         if isinstance(m, nn.Linear):
-            torch.nn.init.trunc_normal_(m.weight, std=0.02)
-            if m.bias is not None:
+            torch.nn.init.xavier_uniform_(m.weight)
+            if isinstance(m, nn.Linear) and m.bias is not None:
                 nn.init.constant_(m.bias, 0)
         elif isinstance(m, nn.LayerNorm):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
-        elif isinstance(m, nn.Conv3d):
-            torch.nn.init.trunc_normal_(m.weight, std=0.02)
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-    
+
     def forward_features(self, x):
-        """Forward pass through the transformer blocks."""
-        B = x.shape[0]
-        
-        # Patch embedding
-        x = self.patch_embed(x)  # (B, num_patches, embed_dim)
-        
-        # Add positional encoding
-        x = self.pos_embed(x)
-        
-        # Add class token
-        cls_tokens = self.cls_token.expand(B, -1, -1)
-        x = torch.cat((cls_tokens, x), dim=1)
-        
-        # Apply dropout
-        x = self.dropout(x)
-        
-        # Pass through transformer blocks
-        for block in self.blocks:
-            x = block(x)
-        
-        # Final layer norm
-        x = self.norm(x)
-        
-        return x
-    
-    def forward(self, x):
-        """Forward pass."""
-        x = self.forward_features(x)
-        
-        # Extract class token for classification
-        cls_token = x[:, 0]
-        x = self.head(cls_token)
-        
-        return x
-    
-    def get_intermediate_features(self, x, layer_idx: int = 6):
-        """Get features from a specific layer (useful for SAE training)."""
-        B = x.shape[0]
-        
-        # Patch embedding
         x = self.patch_embed(x)
-        x = self.pos_embed(x)
-        
-        # Add class token
-        cls_tokens = self.cls_token.expand(B, -1, -1)
-        x = torch.cat((cls_tokens, x), dim=1)
-        x = self.dropout(x)
-        
-        # Pass through blocks up to layer_idx
-        for i, block in enumerate(self.blocks):
-            x = block(x)
-            if i == layer_idx:
-                return x
-        
-        return self.norm(x)
+        cls_token = self.cls_token.expand(x.shape[0], -1, -1)
+        x = torch.cat((cls_token, x), dim=1)
+        x = x + self.pos_embed
+
+        for blk in self.blocks:
+            x = blk(x)
+
+        x = self.norm(x)
+        return x
+
+    def forward(self, x):
+        x = self.forward_features(x)
+        if self.global_pool:
+            x = x[:, 1:, :].mean(dim=1)  # global pool without cls token
+            outcome = self.head(x)
+        else:
+            x = x[:, 0] # CLS token
+            outcome = self.head(x)
+        return outcome
 
 class MaskedAutoencoderViT3D(nn.Module):
-    """3D Masked Autoencoder using Vision Transformer for EM data."""
-    
-    def __init__(self,
-                 volume_size: Tuple[int, int, int] = (64, 64, 64),
-                 patch_size: Tuple[int, int, int] = (8, 8, 8),
-                 in_channels: int = 1,
-                 embed_dim: int = 768,
-                 depth: int = 12,
-                 num_heads: int = 12,
-                 decoder_embed_dim: int = 512,
-                 decoder_depth: int = 8,
-                 decoder_num_heads: int = 16,
-                 mlp_ratio: float = 4.0,
-                 dropout: float = 0.1,
-                 mask_ratio: float = 0.75):
+    """ Masked Auto-Encoder with VisionTransformer backbone
+    """
+    def __init__(self, volume_size=(64,64,64), patch_size=(8,8,8), in_chans=1,
+                 embed_dim=768, depth=12, num_heads=12,
+                 decoder_embed_dim=512, decoder_depth=8, decoder_num_heads=16,
+                 mlp_ratio=4., norm_layer=nn.LayerNorm, norm_pix_loss=False, mask_ratio=0.75):
         super().__init__()
-        
-        self.mask_ratio = mask_ratio
-        self.patch_size = patch_size
-        self.in_channels = in_channels
-        
-        # Encoder (ViT)
+        self.patch_size = to_3tuple(patch_size)
+        self.in_chans = in_chans
+        self.volume_size = volume_size
+
+        # --------------------------------------------------------------------------
+        # MAE encoder specifics
         self.encoder = ViT3D(
             volume_size=volume_size,
-            patch_size=patch_size, 
-            in_channels=in_channels,
+            patch_size=patch_size,
+            in_chans=in_chans,
             embed_dim=embed_dim,
             depth=depth,
             num_heads=num_heads,
             mlp_ratio=mlp_ratio,
-            dropout=dropout,
-            num_classes=0  # No classification head
-        )
-        
-        # Decoder
+            qkv_bias=True,
+            norm_layer=norm_layer)
+        # --------------------------------------------------------------------------
+
+        # --------------------------------------------------------------------------
+        # MAE decoder specifics
         self.decoder_embed = nn.Linear(embed_dim, decoder_embed_dim, bias=True)
-        
-        # Mask token
-        self.mask_token = nn.Parameter(torch.randn(decoder_embed_dim) * 0.02)
-        
-        # Decoder positional encoding
-        num_patches = self.encoder.patch_embed.num_patches
-        self.decoder_pos_embed = nn.Parameter(torch.randn(1, num_patches + 1, decoder_embed_dim) * 0.02)
-        
-        # Decoder transformer blocks
+
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_embed_dim))
+
+        self.decoder_pos_embed = nn.Parameter(torch.zeros(1, self.encoder.patch_embed.num_patches + 1, decoder_embed_dim), requires_grad=False)  # fixed sin-cos embedding
+
         self.decoder_blocks = nn.ModuleList([
-            TransformerBlock(decoder_embed_dim, decoder_num_heads, mlp_ratio, dropout)
-            for _ in range(decoder_depth)
-        ])
-        
-        self.decoder_norm = nn.LayerNorm(decoder_embed_dim)
-        
-        # Decoder prediction head
-        patch_volume = patch_size[0] * patch_size[1] * patch_size[2] * in_channels
-        self.decoder_pred = nn.Linear(decoder_embed_dim, patch_volume, bias=True)
-        self.decoder_pred_activation = nn.Sigmoid()
-        
-        # Initialize weights
-        self.apply(self._init_weights)
-        
-    def _init_weights(self, m):
+            Block(decoder_embed_dim, decoder_num_heads, mlp_ratio, qkv_bias=True, norm_layer=norm_layer)
+            for i in range(decoder_depth)])
+
+        self.decoder_norm = norm_layer(decoder_embed_dim)
+        patch_dim = self.patch_size[0] * self.patch_size[1] * self.patch_size[2] * in_chans
+        self.decoder_pred = nn.Linear(decoder_embed_dim, patch_dim, bias=True) # decoder to patch
+        # --------------------------------------------------------------------------
+
+        self.norm_pix_loss = norm_pix_loss
+
+        self.init_weights()
+
+    def init_weights(self):
+        # Encoder weights are initialized in its own class
+        # Initialize decoder_pos_embed and mask_token
+        decoder_pos_embed_table = get_sinusoid_encoding_table_3d(self.decoder_pos_embed.shape[1] - 1, self.decoder_pos_embed.shape[-1])
+        self.decoder_pos_embed.data[:, 1:, :].copy_(decoder_pos_embed_table.unsqueeze(0))
+        torch.nn.init.normal_(self.mask_token, std=.02)
+
+        self.apply(self._init_weights_linear_layernorm)
+
+    def _init_weights_linear_layernorm(self, m):
         if isinstance(m, nn.Linear):
-            torch.nn.init.trunc_normal_(m.weight, std=0.02)
-            if m.bias is not None:
+            torch.nn.init.xavier_uniform_(m.weight)
+            if isinstance(m, nn.Linear) and m.bias is not None:
                 nn.init.constant_(m.bias, 0)
         elif isinstance(m, nn.LayerNorm):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
-    
-    def patchify(self, volumes):
-        """Convert volumes to patches."""
-        B, C, D, H, W = volumes.shape
-        pd, ph, pw = self.patch_size
+
+    def patchify(self, imgs):
+        p = self.patch_size
+        c = self.in_chans
+        d, h, w = imgs.shape[2], imgs.shape[3], imgs.shape[4]
+        assert d % p[0] == 0 and h % p[1] == 0 and w % p[2] == 0
         
-        assert D % pd == 0 and H % ph == 0 and W % pw == 0
+        pd, ph, pw = d // p[0], h // p[1], w // p[2]
         
-        d = D // pd
-        h = H // ph  
-        w = W // pw
-        
-        x = volumes.reshape(B, C, d, pd, h, ph, w, pw)
-        x = x.permute(0, 2, 4, 6, 1, 3, 5, 7).contiguous()
-        x = x.reshape(B, d * h * w, C * pd * ph * pw)
-        
+        x = imgs.reshape(imgs.shape[0], c, pd, p[0], ph, p[1], pw, p[2])
+        x = x.permute(0, 2, 4, 6, 3, 5, 7, 1).contiguous() # N, Pd, Ph, Pw, P0, P1, P2, C
+        x = x.view(imgs.shape[0], pd * ph * pw, p[0] * p[1] * p[2] * c)
         return x
-    
-    def unpatchify(self, patches):
-        """Convert patches back to volumes."""
-        B, N, patch_dim = patches.shape
-        pd, ph, pw = self.patch_size
-        C = self.in_channels
+
+    def unpatchify(self, x):
+        p = self.patch_size
+        c = self.in_chans
+        d_vol, h_vol, w_vol = self.volume_size
+
+        pd, ph, pw = d_vol // p[0], h_vol // p[1], w_vol // p[2]
+        assert pd * ph * pw == x.shape[1]
         
-        assert patch_dim == C * pd * ph * pw
-        
-        # Use explicit patch counts from encoder's patch_embed module
-        d_patches = self.encoder.patch_embed.num_patches_d
-        h_patches = self.encoder.patch_embed.num_patches_h
-        w_patches = self.encoder.patch_embed.num_patches_w
-        assert d_patches * h_patches * w_patches == N, f"Total patches {N} does not match product of per-dimension patches {d_patches*h_patches*w_patches}"
-        
-        x = patches.reshape(B, d_patches, h_patches, w_patches, C, pd, ph, pw)
-        x = x.permute(0, 4, 1, 5, 2, 6, 3, 7).contiguous() # B, C, d_patches, pd, h_patches, ph, w_patches, pw
-        x = x.reshape(B, C, d_patches * pd, h_patches * ph, w_patches * pw) # B, C, D, H, W
-        
-        return x
-    
+        x = x.view(x.shape[0], pd, ph, pw, p[0], p[1], p[2], c)
+        x = x.permute(0, 7, 1, 4, 2, 5, 3, 6).contiguous() # N, C, Pd, P0, Ph, P1, Pw, P2
+        imgs = x.view(x.shape[0], c, d_vol, h_vol, w_vol)
+        return imgs
+
     def random_masking(self, x, mask_ratio):
-        """Perform random masking."""
-        B, N, D = x.shape  # batch, length, dim
-        len_keep = int(N * (1 - mask_ratio))
+        N, L, D_emb = x.shape
+        len_keep = int(L * (1 - mask_ratio))
         
-        noise = torch.rand(B, N, device=x.device)  # noise in [0, 1]
-        
-        # Sort noise for each sample
-        ids_shuffle = torch.argsort(noise, dim=1)  # ascend: small is keep, large is remove
+        noise = torch.rand(N, L, device=x.device)
+        ids_shuffle = torch.argsort(noise, dim=1)
         ids_restore = torch.argsort(ids_shuffle, dim=1)
-        
-        # Keep the first subset
+
         ids_keep = ids_shuffle[:, :len_keep]
-        x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
-        
-        # Generate the binary mask: 0 is keep, 1 is remove
-        mask = torch.ones([B, N], device=x.device)
+        x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).expand(-1, -1, D_emb))
+
+        mask = torch.ones([N, L], device=x.device)
         mask[:, :len_keep] = 0
-        # Unshuffle to get the binary mask
         mask = torch.gather(mask, dim=1, index=ids_restore)
-        
         return x_masked, mask, ids_restore
-    
+
     def forward_encoder(self, x, mask_ratio):
-        """Forward pass through encoder with masking."""
-        B = x.shape[0]
-        
-        # Patch embedding
         x = self.encoder.patch_embed(x)
-        x = self.encoder.pos_embed(x)
-        
-        # Add class token
-        cls_token = self.encoder.cls_token.expand(B, -1, -1)
-        x = torch.cat((cls_token, x), dim=1)
-        
-        # Masking: only mask the patch tokens (not the class token)
-        cls_tokens = x[:, :1, :]  # Extract class token
-        patch_tokens = x[:, 1:, :]  # Extract patch tokens
-        
-        patch_tokens_masked, mask, ids_restore = self.random_masking(patch_tokens, mask_ratio)
-        
-        # Concatenate class token back
-        x = torch.cat((cls_tokens, patch_tokens_masked), dim=1)
-        
-        # Apply Transformer blocks
-        x = self.encoder.dropout(x)
-        for block in self.encoder.blocks:
-            x = block(x)
+        x = x + self.encoder.pos_embed[:, 1:, :] # Add pos embed, excluding CLS token part
+
+        x, mask, ids_restore = self.random_masking(x, mask_ratio)
+
+        cls_token = self.encoder.cls_token + self.encoder.pos_embed[:, :1, :] # CLS token + its pos embed
+        cls_tokens = cls_token.expand(x.shape[0], -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)
+
+        for blk in self.encoder.blocks:
+            x = blk(x)
         x = self.encoder.norm(x)
-        
         return x, mask, ids_restore
-    
+
     def forward_decoder(self, x, ids_restore):
-        """Forward pass through decoder."""
-        # Embed tokens
         x = self.decoder_embed(x)
+        mask_tokens = self.mask_token.repeat(x.shape[0], ids_restore.shape[1] + 1 - x.shape[1], 1)
         
-        # Separate class token from patches
-        cls_token = x[:, :1, :]  # Class token
-        patch_tokens = x[:, 1:, :]  # Patch tokens
+        # x is [N, 1 (cls) + K (kept), D_dec_emb]
+        # ids_restore is [N, L_orig]
+        # mask_tokens is [N, L_orig - K, D_dec_emb]
         
-        # Append mask tokens to sequence (only for patches)
-        mask_tokens = self.mask_token.repeat(x.shape[0], ids_restore.shape[1] - patch_tokens.shape[1], 1)
-        x_ = torch.cat([patch_tokens, mask_tokens], dim=1)  # no cls token
-        x_ = torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2]))  # unshuffle
-        x = torch.cat([cls_token, x_], dim=1)  # append cls token
+        # Remove CLS token from x for unshuffle, then add back
+        x_no_cls = x[:, 1:, :]
+        x_ = torch.cat([x_no_cls, mask_tokens], dim=1) # [N, L_orig, D_dec_emb]
+        x_ = torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).expand(-1, -1, x.shape[2]))
         
-        # Add positional encoding - make sure dimensions match
-        if x.shape[1] != self.decoder_pos_embed.shape[1]:
-            # Resize positional embedding if needed
-            decoder_pos_embed = self.decoder_pos_embed[:, :x.shape[1], :]
-        else:
-            decoder_pos_embed = self.decoder_pos_embed
-            
-        x = x + decoder_pos_embed
-        
-        # Apply Transformer blocks
-        for block in self.decoder_blocks:
-            x = block(x)
+        x = torch.cat([x[:, :1, :], x_], dim=1) # Prepend CLS token: [N, 1 + L_orig, D_dec_emb]
+        x = x + self.decoder_pos_embed
+
+        for blk in self.decoder_blocks:
+            x = blk(x)
         x = self.decoder_norm(x)
-        
-        # Predictor
         x = self.decoder_pred(x)
-        x = self.decoder_pred_activation(x)
-        
-        # Remove class token
-        x = x[:, 1:, :]
-        
+        x = x[:, 1:, :] # Remove CLS token
         return x
-    
-    def forward_loss(self, volumes, pred, mask):
-        """Compute reconstruction loss."""
-        target = self.patchify(volumes)
-        
+
+    def forward_loss(self, imgs, pred, mask):
+        target = self.patchify(imgs)
+        if self.norm_pix_loss:
+            mean = target.mean(dim=-1, keepdim=True)
+            var = target.var(dim=-1, keepdim=True)
+            target = (target - mean) / (var.add(1.e-6).sqrt())
+
         loss = (pred - target) ** 2
-        loss = loss.mean(dim=-1)  # [B, N], mean loss per patch
-        
-        # Handle case where mask.sum() is zero (e.g., mask_ratio = 0.0)
-        if mask.sum() == 0:
-            # If no masks, MAE acts like a normal autoencoder, loss is over all patches
-            # This also means the 'mask' input to this function is all zeros.
-            # The 'loss' variable currently holds per-patch losses.
-            # We need the mean of these per-patch losses.
-            final_loss = loss.mean()
-        else:
-            final_loss = (loss * mask).sum() / mask.sum()  # mean loss on removed patches
-            
-        return final_loss
-    
-    def forward(self, volumes, mask_ratio=None):
-        """Forward pass."""
-        if mask_ratio is None:
-            mask_ratio = self.mask_ratio
-            
-        latent, mask, ids_restore = self.forward_encoder(volumes, mask_ratio)
+        loss = loss.mean(dim=-1)
+        loss = (loss * mask).sum() / mask.sum()
+        return loss
+
+    def forward(self, imgs, mask_ratio=None):
+        latent, mask, ids_restore = self.forward_encoder(imgs, mask_ratio if mask_ratio is not None else self.mask_ratio)
         pred = self.forward_decoder(latent, ids_restore)
-        loss = self.forward_loss(volumes, pred, mask)
-        
+        loss = self.forward_loss(imgs, pred, mask)
         return loss, pred, mask
 
-def get_device():
-    """Get the best available device for training."""
-    if torch.cuda.is_available():
-        return torch.device('cuda')
-    elif torch.backends.mps.is_available() and platform.system() == 'Darwin':
-        # Check if Conv3D is supported on MPS
-        try:
-            # Test with a small conv3d operation
-            test_tensor = torch.randn(1, 1, 4, 4, 4).to('mps')
-            test_conv = nn.Conv3d(1, 1, 3).to('mps')
-            _ = test_conv(test_tensor)
-            return torch.device('mps')
-        except RuntimeError as e:
-            if "Conv3D is only supported on MPS for MacOS" in str(e):
-                print("Warning: Conv3D not supported on this MPS version, falling back to CPU")
-                return torch.device('cpu')
-            else:
-                print(f"MPS error: {e}, falling back to CPU")
-                return torch.device('cpu')
-    else:
-        return torch.device('cpu')
+MaskedAutoencoderViT = MaskedAutoencoderViT3D
+ViT = ViT3D 
 
-# Model configurations for different scales
-def vit_3d_tiny(**kwargs):
-    """ViT-3D Tiny configuration."""
-    model = ViT3D(
-        embed_dim=192, depth=12, num_heads=3, mlp_ratio=4, **kwargs
-    )
-    return model
-
-def vit_3d_small(**kwargs):
-    """ViT-3D Small configuration."""
-    model = ViT3D(
-        embed_dim=384, depth=12, num_heads=6, mlp_ratio=4, **kwargs
-    )
-    return model
-
-def vit_3d_base(**kwargs):
-    """ViT-3D Base configuration (ViT-B)."""
-    model = ViT3D(
-        embed_dim=768, depth=12, num_heads=12, mlp_ratio=4, **kwargs
-    )
-    return model
-
-def vit_3d_large(**kwargs):
-    """ViT-3D Large configuration."""
-    model = ViT3D(
-        embed_dim=1024, depth=24, num_heads=16, mlp_ratio=4, **kwargs
-    )
-    return model
+# --- Factory functions for MAE ViT 3D models ---
 
 def mae_vit_3d_base(**kwargs):
     """MAE ViT-3D Base configuration."""
@@ -562,34 +408,37 @@ def mae_vit_3d_small(**kwargs):
     )
     return model
 
-if __name__ == "__main__":
-    # Test the model
-    device = get_device()
-    print(f"Using device: {device}")
-    
-    # Create a small test volume
-    batch_size = 2
-    volume_size = (32, 32, 32)  # Smaller for testing
-    test_volume = torch.randn(batch_size, 1, *volume_size).to(device)
-    
-    # Test regular ViT
-    print("Testing ViT-3D...")
-    model = vit_3d_small(volume_size=volume_size, patch_size=(8, 8, 8)).to(device)
-    output = model(test_volume)
-    print(f"ViT output shape: {output.shape}")
-    
-    # Test MAE
-    print("\nTesting MAE ViT-3D...")
-    mae_model = mae_vit_3d_small(volume_size=volume_size, patch_size=(8, 8, 8)).to(device)
-    loss, pred, mask = mae_model(test_volume)
-    print(f"MAE loss: {loss.item():.4f}")
-    print(f"Prediction shape: {pred.shape}")
-    print(f"Mask shape: {mask.shape}")
-    print(f"Masking ratio: {mask.mean().item():.2f}")
-    
-    # Test intermediate features (for SAE later)
-    print("\nTesting intermediate features...")
-    features = model.get_intermediate_features(test_volume, layer_idx=6)
-    print(f"Layer 6 features shape: {features.shape}")
-    
-    print("\nAll tests passed! ✅") 
+def mae_vit_3d_large(**kwargs):
+    """MAE ViT-3D Large configuration for maximum capacity."""
+    model = MaskedAutoencoderViT3D(
+        embed_dim=1024, depth=24, num_heads=16,
+        decoder_embed_dim=512, decoder_depth=8, decoder_num_heads=16,
+        mlp_ratio=4, **kwargs
+    )
+    return model
+
+def mae_vit_3d_huge(**kwargs):
+    """MAE ViT-3D Huge configuration for extreme capacity."""
+    model = MaskedAutoencoderViT3D(
+        embed_dim=1280, depth=32, num_heads=16,
+        decoder_embed_dim=640, decoder_depth=8, decoder_num_heads=16,
+        mlp_ratio=4, **kwargs
+    )
+    return model
+
+def mae_vit_3d_hemibrain_optimal(**kwargs):
+    """
+    MAE ViT-3D configuration optimized for complex biological data like Hemibrain.
+    - Encoder is ViT-Large.
+    - Decoder is stronger than default (closer to ViT-Base) for high-fidelity reconstruction.
+    """
+    model = MaskedAutoencoderViT3D(
+        embed_dim=1024,         # Large: 1024
+        depth=24,               # Large: 24
+        num_heads=16,           # Large: 16
+        decoder_embed_dim=768,  # Increased from 512 to 768
+        decoder_depth=12,       # Increased from 8 to 12
+        decoder_num_heads=12,   # Increased from 16 to 12 (to match decoder_embed_dim)
+        mlp_ratio=4, **kwargs
+    )
+    return model

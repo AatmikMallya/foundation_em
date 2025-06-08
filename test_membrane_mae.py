@@ -1,234 +1,622 @@
+import argparse
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader
-import matplotlib.pyplot as plt
-import numpy as np
-from pathlib import Path
-import time
-from tqdm import tqdm
+from torch.utils.data import DataLoader, Subset
 import wandb
+import numpy as np
+import matplotlib.pyplot as plt
+plt.switch_backend('Agg') # Explicitly set backend for headless environments
+from tqdm import tqdm
+import os
+from pathlib import Path
+import copy
 
-# Import our modules
-from vit_3d import mae_vit_3d_small, get_device
-from membrane_synthetic_data import create_membrane_dataloader # Updated import
+# Added for potential performance improvement
+torch.backends.cudnn.benchmark = True
 
-def train_mae_one_epoch(model, dataloader, optimizer, device, epoch, mask_ratio):
-    model.train()
-    total_loss = 0
-    num_batches = len(dataloader)
-    
-    progress_bar = tqdm(dataloader, desc=f"Epoch {epoch} (Mask {mask_ratio*100:.0f}%)")
-    
-    for batch_idx, volumes in enumerate(progress_bar):
-        volumes = volumes.to(device)
-        loss, pred, mask = model(volumes, mask_ratio=mask_ratio)
-        
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        
-        total_loss += loss.item()
-        
-        if batch_idx % (num_batches // 5) == 0: # Update progress bar 5 times per epoch
-            progress_bar.set_postfix({
-                'loss': f'{loss.item():.4f}',
-                'avg_loss': f'{total_loss/(batch_idx+1):.4f}'
-            })
-    
-    avg_loss = total_loss / num_batches
-    return avg_loss
+from vit_3d import mae_vit_3d_small, mae_vit_3d_base, mae_vit_3d_large, mae_vit_3d_huge, mae_vit_3d_hemibrain_optimal, get_device
+from membrane_synthetic_data import create_membrane_dataloader
 
-def evaluate_mae(model, dataloader, device, mask_ratio):
-    model.eval()
-    total_loss = 0
-    num_batches = len(dataloader)
+# --- EMA (Exponential Moving Average) Implementation ---
+class EMAModel:
+    """Exponential Moving Average model for better validation performance."""
+    def __init__(self, model, decay=0.9999):
+        self.decay = decay
+        self.ema_model = copy.deepcopy(model)
+        for param in self.ema_model.parameters():
+            param.requires_grad_(False)
+        self.num_updates = 0
     
-    with torch.no_grad():
-        for volumes in dataloader:
-            volumes = volumes.to(device)
-            loss, pred, mask = model(volumes, mask_ratio=mask_ratio)
-            total_loss += loss.item()
-            
-    return total_loss / num_batches
+    def update(self, model):
+        """Update EMA model with current model parameters."""
+        self.num_updates += 1
+        # Adjust decay based on number of updates for better early training
+        decay = min(self.decay, (1 + self.num_updates) / (10 + self.num_updates))
+        
+        with torch.no_grad():
+            for ema_param, model_param in zip(self.ema_model.parameters(), model.parameters()):
+                ema_param.data.mul_(decay).add_(model_param.data, alpha=1 - decay)
+    
+    def get_model(self):
+        """Get the EMA model for evaluation."""
+        return self.ema_model
+
+# --- New Learning Rate Scheduler with Warmup ---
+def get_lr_scheduler_with_warmup(optimizer, warmup_epochs, total_epochs, min_lr=1e-6, initial_lr=1e-4):
+    """
+    Creates a learning rate scheduler with a linear warmup phase followed by cosine annealing.
+    """
+    def lr_lambda(current_epoch):
+        if current_epoch < warmup_epochs:
+            # Linear warmup
+            return float(current_epoch + 1) / float(max(1, warmup_epochs))
+        # Cosine annealing phase
+        progress = float(current_epoch - warmup_epochs) / float(max(1, total_epochs - warmup_epochs))
+        cosine_decay = 0.5 * (1.0 + np.cos(np.pi * progress))
+        # Ensure that the learning rate doesn't go below min_lr relative to initial_lr
+        # The scheduler multiplies the optimizer's initial LR by the output of this lambda
+        # So, to get an effective LR of min_lr, lambda should output min_lr / initial_lr
+        decayed_lr_multiplier = cosine_decay
+        min_lr_multiplier = min_lr / initial_lr
+        return max(min_lr_multiplier, decayed_lr_multiplier)
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+# --- New Progressive Mask Schedule ---
+def get_progressive_mask_ratio(epoch, 
+                               warmup_mask_ratio=0.75, warmup_mask_epochs=200,
+                               ramp_start_epoch=201, ramp_end_epoch=1000, 
+                               min_ramp_mask_ratio=0.75, max_ramp_mask_ratio=0.75,
+                               final_mask_ratio=0.75):
+    """
+    Calculates the mask ratio based on the current epoch.
+    Phase 1: Constant low mask ratio during warmup.
+    Phase 2: Gradual linear increase in mask ratio.
+    Phase 3: Constant high mask ratio for refinement.
+    """
+    if epoch <= warmup_mask_epochs:
+        return warmup_mask_ratio
+    elif epoch <= ramp_end_epoch: # ramp_start_epoch is implicitly handled
+        progress_in_ramp = float(epoch - warmup_mask_epochs) / float(max(1, ramp_end_epoch - warmup_mask_epochs))
+        return min_ramp_mask_ratio + progress_in_ramp * (max_ramp_mask_ratio - min_ramp_mask_ratio)
+    else:
+        return final_mask_ratio
 
 def visualize_reconstructions(model, dataloader, device, epoch, mask_ratio, dataset_name, num_examples=5, save_dir="membrane_visualizations"):
-    """Visualize reconstructions for a given number of examples from a dataloader."""
+    """Visualize reconstructions, log 3D point clouds for the first example, and return paths for 2D images."""
     model.eval()
     Path(save_dir).mkdir(parents=True, exist_ok=True)
     
     examples_shown = 0
-    all_originals = []
-    all_reconstructed = []
-    all_losses = []
+    all_originals_np = []
+    all_reconstructed_np = []
+    # For collecting 2D image paths
+    individual_original_image_paths = []
+    individual_recon_image_paths = []
+    summary_image_path = None
 
     with torch.no_grad():
         for batch_volumes in dataloader:
             if examples_shown >= num_examples:
                 break
             volumes_to_device = batch_volumes.to(device)
-            loss_batch, pred_batch, _ = model(volumes_to_device, mask_ratio=mask_ratio)
-            
-            reconstructed_batch = model.unpatchify(pred_batch.cpu())
-            original_batch = batch_volumes # Keep originals on CPU
+            # Assuming model returns: loss, predicted_volumes (patchified), mask
+            loss_batch, pred_batch, _ = model(volumes_to_device, mask_ratio=mask_ratio) 
+        
+            reconstructed_batch_np = model.unpatchify(pred_batch.cpu()).numpy()
+            original_batch_np = batch_volumes.cpu().numpy() # Keep originals on CPU
 
             for i in range(volumes_to_device.size(0)):
                 if examples_shown >= num_examples:
                     break
-                all_originals.append(original_batch[i, 0].cpu().numpy())
-                all_reconstructed.append(reconstructed_batch[i, 0].cpu().numpy())
-                # Note: loss_batch is for the whole batch. 
-                # For individual loss, we'd need to re-run or approximate.
-                # For simplicity, we can report batch loss or an average.
-                all_losses.append(loss_batch.item() / volumes_to_device.size(0)) # Approximate per-sample loss
+                all_originals_np.append(original_batch_np[i, 0]) # Assuming (B, C, D, H, W) and C=1
+                all_reconstructed_np.append(reconstructed_batch_np[i, 0])
+                # all_losses.append(loss_batch.item() / volumes_to_device.size(0)) # Not used in this version
                 examples_shown += 1
 
-    if not all_originals:
+    if not all_originals_np:
         print(f"No examples to visualize for {dataset_name}.")
-        return None
+        return [], [], None
 
-    fig, axes = plt.subplots(num_examples, 2, figsize=(10, 3 * num_examples))
-    if num_examples == 1:
-        axes = np.array([axes]) # Make it iterable for single example
-
-    avg_mse_total = 0
+    # Create enhanced visualization with slice grids and orthogonal views for each example
     for i in range(examples_shown):
-        original_np = all_originals[i]
-        reconstructed_np = all_reconstructed[i]
-        slice_idx = original_np.shape[0] // 2
+        original_np = all_originals_np[i]
+        reconstructed_np = all_reconstructed_np[i]
         mse = np.mean((original_np - reconstructed_np)**2)
-        avg_mse_total += mse
+        
+        # --- Save individual original image ---
+        fig_orig = plt.figure(figsize=(20, 12))
+        gs_orig = fig_orig.add_gridspec(3, 4, hspace=0.3, wspace=0.3)
+        D, H, W = original_np.shape
+        slice_indices = np.linspace(D//6, 5*D//6, 9, dtype=int)
+        for j, slice_idx in enumerate(slice_indices):
+            row, col = j // 3, j % 3
+            ax = fig_orig.add_subplot(gs_orig[row, col])
+            ax.imshow(original_np[slice_idx], cmap='gray', vmin=0, vmax=1)
+            ax.set_title(f'Orig Z={slice_idx}', fontsize=8)
+            ax.axis('off')
+        mid_z, mid_y, mid_x = D//2, H//2, W//2
+        ax_orig_axial = fig_orig.add_subplot(gs_orig[0, 3])
+        ax_orig_axial.imshow(original_np[mid_z], cmap='gray', vmin=0, vmax=1); ax_orig_axial.set_title(f'Original Axial (Z={mid_z})'); ax_orig_axial.axis('off')
+        ax_orig_sagittal = fig_orig.add_subplot(gs_orig[1, 3])
+        ax_orig_sagittal.imshow(original_np[:, :, mid_x], cmap='gray', vmin=0, vmax=1); ax_orig_sagittal.set_title(f'Original Sagittal (X={mid_x})'); ax_orig_sagittal.axis('off')
+        ax_orig_coronal = fig_orig.add_subplot(gs_orig[2, 3])
+        ax_orig_coronal.imshow(original_np[:, mid_y, :], cmap='gray', vmin=0, vmax=1); ax_orig_coronal.set_title(f'Original Coronal (Y={mid_y})'); ax_orig_coronal.axis('off')
+        fig_orig.suptitle(f'Epoch {epoch} - {dataset_name.capitalize()} Example {i+1} - ORIGINAL\nMask {mask_ratio*100:.0f}%', fontsize=16)
+        
+        current_original_path = Path(save_dir) / f"{dataset_name}_epoch_{epoch}_example_{i+1}_original_slices.png"
+        fig_orig.tight_layout(rect=[0, 0, 1, 0.96])
+        fig_orig.savefig(current_original_path, dpi=100, bbox_inches='tight') # Lower dpi for faster save
+        plt.close(fig_orig)
+        individual_original_image_paths.append(str(current_original_path))
 
-        axes[i, 0].imshow(original_np[slice_idx], cmap='gray', vmin=0, vmax=1)
-        axes[i, 0].set_title(f'{dataset_name.capitalize()} Original {i+1} (Z={slice_idx})')
-        axes[i, 0].axis('off')
+        # --- Save individual reconstructed image ---
+        fig_recon = plt.figure(figsize=(20, 12))
+        gs_recon = fig_recon.add_gridspec(3, 4, hspace=0.3, wspace=0.3)
+        for j, slice_idx in enumerate(slice_indices):
+            row, col = j // 3, j % 3
+            ax = fig_recon.add_subplot(gs_recon[row, col])
+            ax.imshow(reconstructed_np[slice_idx], cmap='gray', vmin=0, vmax=1)
+            ax.set_title(f'Recon Z={slice_idx}', fontsize=8)
+            ax.axis('off')
+        ax_recon_axial = fig_recon.add_subplot(gs_recon[0, 3])
+        ax_recon_axial.imshow(reconstructed_np[mid_z], cmap='gray', vmin=0, vmax=1); ax_recon_axial.set_title(f'Reconstructed Axial (Z={mid_z})'); ax_recon_axial.axis('off')
+        ax_recon_sagittal = fig_recon.add_subplot(gs_recon[1, 3])
+        ax_recon_sagittal.imshow(reconstructed_np[:, :, mid_x], cmap='gray', vmin=0, vmax=1); ax_recon_sagittal.set_title(f'Reconstructed Sagittal (X={mid_x})'); ax_recon_sagittal.axis('off')
+        ax_recon_coronal = fig_recon.add_subplot(gs_recon[2, 3])
+        ax_recon_coronal.imshow(reconstructed_np[:, mid_y, :], cmap='gray', vmin=0, vmax=1); ax_recon_coronal.set_title(f'Reconstructed Coronal (Y={mid_y})'); ax_recon_coronal.axis('off')
+        fig_recon.suptitle(f'Epoch {epoch} - {dataset_name.capitalize()} Example {i+1} - RECONSTRUCTION\nMask {mask_ratio*100:.0f}% - MSE: {mse:.4f}', fontsize=16)
+        
+        current_recon_path = Path(save_dir) / f"{dataset_name}_epoch_{epoch}_example_{i+1}_reconstruction_slices.png"
+        fig_recon.tight_layout(rect=[0, 0, 1, 0.96])
+        fig_recon.savefig(current_recon_path, dpi=100, bbox_inches='tight') # Lower dpi
+        plt.close(fig_recon)
+        individual_recon_image_paths.append(str(current_recon_path))
 
-        axes[i, 1].imshow(reconstructed_np[slice_idx], cmap='gray', vmin=0, vmax=1)
-        axes[i, 1].set_title(f'{dataset_name.capitalize()} Recon {i+1} (Z={slice_idx})\nMSE: {mse:.4f}')
-        axes[i, 1].axis('off')
+        # --- Log 3D Point Cloud for the FIRST example only ---
+        if i == 0:
+            try:
+                points_orig = np.argwhere(original_np > 0.5).astype(np.float32)
+                if points_orig.shape[0] > 0:
+                    wandb.log({f"{dataset_name}/example_0_original_PointCould": wandb.Object3D(points_orig)}, step=epoch)
+                else:
+                    print(f"WDB: No points in original for 3D cloud (epoch {epoch}, {dataset_name})")
+                
+                points_recon = np.argwhere(reconstructed_np > 0.5).astype(np.float32)
+                if points_recon.shape[0] > 0:
+                    wandb.log({f"{dataset_name}/example_0_reconstructed_PointCloud": wandb.Object3D(points_recon)}, step=epoch)
+                else:
+                    print(f"WDB: No points in reconstruction for 3D cloud (epoch {epoch}, {dataset_name})")
+            except Exception as e_3d:
+                print(f"Error logging 3D point cloud for {dataset_name} example {i}, epoch {epoch}: {e_3d}")
     
-    avg_mse = avg_mse_total / examples_shown if examples_shown > 0 else 0
-    plt.suptitle(f'Epoch {epoch} - {dataset_name.capitalize()} Reconstructions (Mask {mask_ratio*100:.0f}%) - Avg Batch Loss: {np.mean(all_losses):.4f}, Avg Img MSE: {avg_mse:.4f}')
-    plt.tight_layout(rect=[0, 0.03, 1, 0.97])
-    
-    save_path = Path(save_dir) / f"{dataset_name}_epoch_{epoch}_mask_{int(mask_ratio*100)}.png"
-    plt.savefig(save_path, dpi=150)
-    print(f"Visualization saved to {save_path}")
-    plt.close(fig)
-    return str(save_path)
+    # Create a summary comparison figure (using the first example)
+    if examples_shown > 0:
+        avg_mse_all_examples = np.mean([np.mean((all_originals_np[j] - all_reconstructed_np[j])**2) for j in range(examples_shown)])
+        
+        fig_summary, axes_summary = plt.subplots(2, 3, figsize=(15, 10))
+        first_orig_np = all_originals_np[0]
+        first_recon_np = all_reconstructed_np[0]
+        D_s, H_s, W_s = first_orig_np.shape
+        mid_z_s, mid_y_s, mid_x_s = D_s//2, H_s//2, W_s//2
+        
+        axes_summary[0, 0].imshow(first_orig_np[mid_z_s], cmap='gray', vmin=0, vmax=1); axes_summary[0, 0].set_title('Original Axial'); axes_summary[0, 0].axis('off')
+        axes_summary[0, 1].imshow(first_orig_np[:, :, mid_x_s], cmap='gray', vmin=0, vmax=1); axes_summary[0, 1].set_title('Original Sagittal'); axes_summary[0, 1].axis('off')
+        axes_summary[0, 2].imshow(first_orig_np[:, mid_y_s, :], cmap='gray', vmin=0, vmax=1); axes_summary[0, 2].set_title('Original Coronal'); axes_summary[0, 2].axis('off')
+        
+        axes_summary[1, 0].imshow(first_recon_np[mid_z_s], cmap='gray', vmin=0, vmax=1); axes_summary[1, 0].set_title('Reconstructed Axial'); axes_summary[1, 0].axis('off')
+        axes_summary[1, 1].imshow(first_recon_np[:, :, mid_x_s], cmap='gray', vmin=0, vmax=1); axes_summary[1, 1].set_title('Reconstructed Sagittal'); axes_summary[1, 1].axis('off')
+        axes_summary[1, 2].imshow(first_recon_np[:, mid_y_s, :], cmap='gray', vmin=0, vmax=1); axes_summary[1, 2].set_title('Reconstructed Coronal'); axes_summary[1, 2].axis('off')
+        
+        fig_summary.suptitle(f'Epoch {epoch} - {dataset_name.capitalize()} Summary (Example 0)\nMask {mask_ratio*100:.0f}% - Avg MSE over {examples_shown} eg: {avg_mse_all_examples:.4f}', fontsize=14)
+        fig_summary.tight_layout(rect=[0, 0, 1, 0.95])
+        
+        summary_image_path_obj = Path(save_dir) / f"{dataset_name}_epoch_{epoch}_summary_comparison.png"
+        fig_summary.savefig(summary_image_path_obj, dpi=100, bbox_inches='tight') # Lower dpi
+        plt.close(fig_summary)
+        summary_image_path = str(summary_image_path_obj)
+        print(f"Enhanced 2D/3D visualizations generated for {dataset_name}, epoch {epoch}. Summary: {summary_image_path}")
 
-def main():
-    config = {
-        'run_name': 'mae_membrane_200epochs',
-        'project_name': 'mae-3d-membranes',
-        'batch_size': 8, # Can be smaller for larger volumes if memory is an issue
-        'num_epochs': 200,
-        'learning_rate': 1e-4,
-        'volume_size': (64, 64, 64), # For membrane data
-        'patch_size': (8, 8, 8),    # (64/8)^3 = 512 patches
-        'num_train_samples': 2000,
-        'num_val_samples': 400,
-        'initial_mask_ratio': 0.50,
-        'final_mask_ratio': 0.75,
-        'mask_ratio_epoch_split': 100, # Half of num_epochs
-        'num_workers': 0,
-        'visualization_epoch_interval': 10,
-        'num_examples_to_visualize': 5,
-        # Membrane dataset specific parameters (can be tuned)
-        'num_gaussians_range': (10, 20),
-        'gaussian_strength_range': (-1.0, 1.0),
-        'gaussian_sigma_range': (10.0, 20.0),
-        'isovalue_center': 0.0,
-        'membrane_band_width': 0.15,
-        'noise_level': 0.02,
-        'data_seed': 42
-    }
+    return individual_original_image_paths, individual_recon_image_paths, summary_image_path
 
-    wandb.init(project=config['project_name'], name=config['run_name'], config=config)
-    
+def main(args):
     device = get_device()
     print(f"Using device: {device}")
-    wandb.config.update({"device": str(device)}, allow_val_change=True)
 
-    # Create DataLoaders
-    train_dataloader = create_membrane_dataloader(
-        batch_size=config['batch_size'],
-        num_samples=config['num_train_samples'],
-        volume_size=config['volume_size'],
-        num_gaussians_range=config['num_gaussians_range'],
-        gaussian_strength_range=config['gaussian_strength_range'],
-        gaussian_sigma_range=config['gaussian_sigma_range'],
-        isovalue_center=config['isovalue_center'],
-        membrane_band_width=config['membrane_band_width'],
-        noise_level=config['noise_level'],
-        num_workers=config['num_workers'],
-        shuffle=True,
-        seed=config['data_seed']
-    )
-    val_dataloader = create_membrane_dataloader(
-        batch_size=config['batch_size'], # Can use larger batch for val if desired, but keep same for apples-to-apples vis
-        num_samples=config['num_val_samples'],
-        volume_size=config['volume_size'],
-        num_gaussians_range=config['num_gaussians_range'],
-        gaussian_strength_range=config['gaussian_strength_range'],
-        gaussian_sigma_range=config['gaussian_sigma_range'],
-        isovalue_center=config['isovalue_center'],
-        membrane_band_width=config['membrane_band_width'],
-        noise_level=config['noise_level'],
-        num_workers=config['num_workers'],
-        shuffle=False, # No shuffle for val/test
-        seed=config['data_seed'] + 1 if config['data_seed'] is not None else None
-    )
+    # Parameters are now controlled via argparse defaults and command-line arguments
+    # for better flexibility and experiment tracking.
 
-    model = mae_vit_3d_small(
-        volume_size=config['volume_size'],
-        patch_size=config['patch_size']
-    ).to(device)
-    wandb.watch(model, log_freq=1000) # Log model gradients and parameters, adjust freq as needed
+    # Ensure patch_size is a tuple
+    patch_size = tuple(map(int, args.patch_size.split(',')))
+    if len(patch_size) == 1:
+        patch_size = (patch_size[0], patch_size[0], patch_size[0])
+    elif len(patch_size) != 3:
+        raise ValueError("patch_size must be a single integer or three integers separated by commas.")
+    print(f"Using 3D patch size: {patch_size}")
 
-    optimizer = optim.AdamW(model.parameters(), lr=config['learning_rate'], weight_decay=0.05)
-
-    print(f"\nStarting training on membrane data for {config['num_epochs']} epochs...")
-    current_mask_ratio = config['initial_mask_ratio']
-
-    for epoch in range(config['num_epochs']):
-        if epoch >= config['mask_ratio_epoch_split']:
-            current_mask_ratio = config['final_mask_ratio']
-
-        train_loss = train_mae_one_epoch(model, train_dataloader, optimizer, device, epoch + 1, current_mask_ratio)
-        val_loss = evaluate_mae(model, val_dataloader, device, current_mask_ratio) # Evaluate with current mask ratio
-        
-        print(f"Epoch {epoch+1:3d}/{config['num_epochs']:3d} (Mask {current_mask_ratio*100:.0f}%): Train Loss={train_loss:.4f}, Val Loss={val_loss:.4f}")
-        
-        log_dict = {
-            "epoch": epoch + 1,
-            "train_loss": train_loss,
-            "val_loss": val_loss,
-            "mask_ratio": current_mask_ratio,
-            "learning_rate": optimizer.param_groups[0]['lr']
-        }
-
-        if (epoch + 1) % config['visualization_epoch_interval'] == 0 or epoch == 0 or epoch == config['num_epochs'] - 1:
-            print(f"  Generating reconstructions for epoch {epoch + 1}...")
-            try:
-                train_vis_path = visualize_reconstructions(model, train_dataloader, device, epoch + 1, current_mask_ratio, "train", config['num_examples_to_visualize'])
-                if train_vis_path:
-                    log_dict["train_reconstructions"] = wandb.Image(train_vis_path)
-                
-                val_vis_path = visualize_reconstructions(model, val_dataloader, device, epoch + 1, current_mask_ratio, "val", config['num_examples_to_visualize'])
-                if val_vis_path:
-                    log_dict["val_reconstructions"] = wandb.Image(val_vis_path)
-            except Exception as e:
-                print(f"  Visualization failed for epoch {epoch + 1}: {e}")
-        
-        wandb.log(log_dict)
+    # WandB
+    wandb_project = args.project_name if args.project_name else "mae-3d-membranes"
+    run_name = args.run_name
+    if args.overfit_test:
+        run_name += "_overfit_test"
+    wandb.init(project=wandb_project, name=run_name, config=args)
     
-    # Final summary plot is less critical if all metrics are in wandb
-    # but can create one for local record if desired.
-    # For now, rely on wandb's plotting capabilities.
+    wandb.define_metric("epoch")
+    wandb.define_metric("*", step_metric="epoch")
+    if args.overfit_test:
+        wandb.define_metric("overfit_iteration")
+        wandb.define_metric("overfit_loss", step_metric="overfit_iteration")
+        wandb.define_metric("overfit_reconstruction", step_metric="overfit_iteration")
 
-    print("\nTraining with membrane data and wandb logging completed.")
+    # Model (same for both modes)
+    print(f"Selected model architecture: {args.model_arch}")
+    if args.model_arch == "small":
+        model_fn = mae_vit_3d_small
+    elif args.model_arch == "base":
+        model_fn = mae_vit_3d_base
+    elif args.model_arch == "large":
+        model_fn = mae_vit_3d_large
+    elif args.model_arch == "huge":
+        model_fn = mae_vit_3d_huge
+    elif args.model_arch == "hemibrain_optimal":
+        model_fn = mae_vit_3d_hemibrain_optimal
+    else:
+        raise ValueError(f"Unsupported model_arch: {args.model_arch}. Choose from available options.")
+
+    model = model_fn(
+        volume_size=(args.img_size, args.img_size, args.img_size),
+        patch_size=patch_size,
+        norm_pix_loss=args.norm_pix_loss
+    ).to(device)
+    
+    # Compile model for better performance (PyTorch 2.0+)
+    # No fallback: if compilation fails, the job should fail.
+    if hasattr(torch, 'compile'):
+        print("Compiling model with torch.compile for improved performance...")
+        model = torch.compile(model, mode='default')
+        print("Model compilation successful.")
+    else:
+        print("Warning: torch.compile not available. Continuing without compilation.")
+    
+    wandb.watch(model, log_freq=100)
+    # Optimizer now uses learning rate from args
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    
+    # Initialize EMA model
+    if not args.overfit_test:
+        ema_model = EMAModel(model, decay=args.ema_decay)
+        print(f"Initialized EMA model with decay={args.ema_decay}")
+    else:
+        ema_model = None
+    
+    scaler = None
+    if args.use_amp:
+        scaler = torch.cuda.amp.GradScaler()
+        print("Using Automatic Mixed Precision (AMP) with GradScaler.")
+    else:
+        print("AMP is DISABLED. Training with full precision (float32).")
+
+    # --- Apply new LR Scheduler with Warmup ---
+    scheduler = None # Initialize scheduler to None
+    if not args.overfit_test:
+        # Use configurable parameters from args
+        print(f"Using LR scheduler: {args.warmup_epochs}-epoch warmup then cosine annealing over {args.epochs} epochs from {args.learning_rate} to {args.min_lr}.")
+        scheduler = get_lr_scheduler_with_warmup(optimizer, 
+                                                 warmup_epochs=args.warmup_epochs, 
+                                                 total_epochs=args.epochs, 
+                                                 min_lr=args.min_lr, 
+                                                 initial_lr=args.learning_rate)
+
+    if args.overfit_test:
+        print("--- RUNNING OVERFIT TEST ON A SINGLE SAMPLE ---")
+        # Load a single sample
+        overfit_dataset = create_membrane_dataloader(
+            batch_size=1, num_samples=1, volume_size=(args.img_size, args.img_size, args.img_size),
+            num_gaussians_range=args.num_spheres_range, gaussian_sigma_range=args.radius_range,
+            noise_level=args.noise_level, membrane_band_width=args.membrane_band_width,
+            num_additional_spheres_range=args.num_added_spheres,
+            additional_sphere_radius_range=args.added_sphere_radii,
+            num_workers=0, shuffle=False, seed=42, # Fixed seed for consistency
+        )
+        single_volume_loader = overfit_dataset # Dataloader returns the batch directly
+        # Get the single volume once, it will be reused
+        single_volume = next(iter(single_volume_loader)).to(device)
+        if single_volume.ndim == 4: single_volume = single_volume.unsqueeze(1)
+
+        num_overfit_iterations = 2000 # Increased iterations
+        overfit_mask_ratio = 0.50 # Explicitly 50% masking
+        vis_interval_overfit = 100 # Adjusted for more iterations
+        print(f"Training on one sample for {num_overfit_iterations} iterations with mask ratio {overfit_mask_ratio:.2f}")
+
+        model.train()
+        for iteration in tqdm(range(num_overfit_iterations), desc="Overfitting to one sample"):
+            optimizer.zero_grad()
+            loss, _, _ = model(single_volume, mask_ratio=overfit_mask_ratio)
+            if torch.isnan(loss):
+                print(f"NaN loss at iteration {iteration+1}. Stopping overfit test.")
+                break
+            loss.backward()
+            optimizer.step()
+            
+            wandb.log({"overfit_loss": loss.item(), "overfit_iteration": iteration + 1})
+
+            if (iteration + 1) % vis_interval_overfit == 0 or iteration == num_overfit_iterations - 1:
+                print(f"  Visualizing overfit reconstruction at iteration {iteration + 1}...")
+                try:
+                    # Create a temporary dataloader with the single sample for visualization function
+                    temp_vis_loader = [(single_volume.cpu())] # visualize_reconstructions expects an iterable of batches
+                    vis_path = visualize_reconstructions(model, temp_vis_loader, device, iteration + 1, overfit_mask_ratio, "overfit_sample", num_examples=1)
+                    if vis_path:
+                        wandb.log({"overfit_reconstruction": wandb.Image(vis_path), "overfit_iteration": iteration + 1})
+                except Exception as e:
+                    print(f"  Overfit visualization failed: {e}")
+        print("--- OVERFIT TEST COMPLETE ---")
+
+    else: # Regular training mode
+        # Dataset and DataLoader (Original logic)
+        print("Loading training dataset...")
+        train_loader = create_membrane_dataloader(
+            batch_size=args.batch_size, num_samples=args.train_samples, volume_size=(args.img_size, args.img_size, args.img_size),
+            num_gaussians_range=args.num_spheres_range, gaussian_sigma_range=args.radius_range,
+            noise_level=args.noise_level, membrane_band_width=args.membrane_band_width,
+            num_additional_spheres_range=args.num_added_spheres,
+            additional_sphere_radius_range=args.added_sphere_radii,
+            num_workers=args.num_workers, shuffle=True, seed=0,
+        )
+        print(f"Training dataset loaded with {args.train_samples} samples.")
+
+        print("Loading validation dataset...")
+        val_loader = create_membrane_dataloader(
+            batch_size=args.batch_size, num_samples=args.val_samples, volume_size=(args.img_size, args.img_size, args.img_size),
+            num_gaussians_range=args.num_spheres_range, gaussian_sigma_range=args.radius_range,
+            noise_level=args.noise_level, membrane_band_width=args.membrane_band_width,
+            num_additional_spheres_range=args.num_added_spheres,
+            additional_sphere_radius_range=args.added_sphere_radii,
+            num_workers=args.num_workers, shuffle=False, seed=args.train_samples,
+            drop_last=False  # Don't drop validation batches
+        )
+        print(f"Validation dataset loaded with {args.val_samples} samples.")
+
+        vis_train_loader = create_membrane_dataloader(
+            batch_size=1, num_samples=min(args.vis_samples, args.train_samples), volume_size=(args.img_size, args.img_size, args.img_size),
+            num_gaussians_range=args.num_spheres_range, gaussian_sigma_range=args.radius_range,
+            noise_level=args.noise_level, membrane_band_width=args.membrane_band_width,
+            num_additional_spheres_range=args.num_added_spheres,
+            additional_sphere_radius_range=args.added_sphere_radii,
+            num_workers=args.num_workers, shuffle=False, seed=0,
+            drop_last=False  # Don't drop visualization batches
+        )
+        vis_val_loader = create_membrane_dataloader(
+            batch_size=1, num_samples=min(args.vis_samples, args.val_samples), volume_size=(args.img_size, args.img_size, args.img_size),
+            num_gaussians_range=args.num_spheres_range, gaussian_sigma_range=args.radius_range,
+            noise_level=args.noise_level, membrane_band_width=args.membrane_band_width,
+            num_additional_spheres_range=args.num_added_spheres,
+            additional_sphere_radius_range=args.added_sphere_radii,
+            num_workers=args.num_workers, shuffle=False, seed=args.train_samples,
+            drop_last=False  # Don't drop validation batches for visualization
+        )
+        
+        print(f"Starting training on membrane data for {args.epochs} epochs...")
+        for epoch in range(args.epochs):
+            # Get current mask ratio from the new schedule
+            current_mask_ratio = get_progressive_mask_ratio(epoch + 1) # epoch + 1 for 1-indexed
+            
+            # --- On-the-fly data generation ---
+            # The set_epoch call is crucial to ensure that each epoch gets
+            # a new, unique set of generated samples.
+            train_loader.dataset.set_epoch(epoch)
+            # We also set the epoch for the visualization loader to be consistent
+            vis_train_loader.dataset.set_epoch(epoch)
+            # Note: val and vis_val loaders use a fixed seed and don't have their epoch set,
+            # so they will produce the same validation set across runs for consistency.
+            
+            model.train()
+            epoch_loss = 0
+            # For validation: get the first batch of the current epoch
+            first_batch_for_logging = None
+
+            progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Training] (Mask {current_mask_ratio*100:.0f}%)", unit="batch")
+            
+            for batch_idx, volumes in enumerate(progress_bar):
+                if batch_idx == 0: # Capture the first batch
+                    first_batch_for_logging = volumes.detach().cpu().clone() # Ensure it's on CPU and a copy
+
+                volumes = volumes.to(device)
+                if volumes.ndim == 4: volumes = volumes.unsqueeze(1)
+
+                optimizer.zero_grad(set_to_none=True)
+                
+                if args.use_amp and scaler:
+                    with torch.cuda.amp.autocast():
+                        loss, _, _ = model(volumes, mask_ratio=current_mask_ratio)
+                    if torch.isnan(loss):
+                        print(f"NaN loss detected at epoch {epoch+1}, batch {batch_idx} (AMP). Skipping batch.")
+                        continue
+                    scaler.scale(loss).backward()
+                    if args.grad_clip_norm > 0:
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else: 
+                    loss, _, _ = model(volumes, mask_ratio=current_mask_ratio)
+                    if torch.isnan(loss):
+                        print(f"NaN loss detected at epoch {epoch+1}, batch {batch_idx}. Skipping batch.")
+                        continue
+                    loss.backward()
+                    if args.grad_clip_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
+                    optimizer.step()
+                
+                # Update EMA model after each batch
+                if ema_model is not None:
+                    ema_model.update(model)
+            
+                epoch_loss += loss.item()
+                progress_bar.set_postfix(loss=loss.item(), lr=optimizer.param_groups[0]['lr'], mask=f"{current_mask_ratio:.2f}")
+
+            avg_train_loss = epoch_loss / len(train_loader) if len(train_loader) > 0 else 0
+            print(f"Epoch {epoch+1}/{args.epochs} (Mask {current_mask_ratio*100:.0f}%) - Training Loss: {avg_train_loss:.4f}, LR: {optimizer.param_groups[0]['lr']:.6f}")
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            # --- Log data characteristic --- 
+            log_data_characteristic = {}
+            if first_batch_for_logging is not None and first_batch_for_logging.nelement() > 0:
+                # Calculate a simple characteristic, e.g., sum of the first sample in the first batch
+                sample_sum = first_batch_for_logging[0].sum().item()
+                log_data_characteristic = {"epoch_first_train_batch_sample_sum": sample_sum}
+                if epoch < 5 or (epoch + 1) % 100 == 0 : # Print for early epochs and then occasionally
+                    print(f"Epoch {epoch+1} - First train batch, first sample sum: {sample_sum:.4f}")
+            # --- End log data characteristic ---
+
+            # Validation using EMA model if available
+            eval_model = ema_model.get_model() if ema_model else model
+            eval_model.eval()
+            val_loss = 0
+            progress_bar_val = tqdm(val_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Validation] (Mask {current_mask_ratio*100:.0f}%)", unit="batch")
+            with torch.no_grad():
+                for volumes_val in progress_bar_val:
+                    volumes_val = volumes_val.to(device)
+                    if volumes_val.ndim == 4: volumes_val = volumes_val.unsqueeze(1)
+                
+                    with torch.cuda.amp.autocast(enabled=args.use_amp):
+                        loss_val, _, _ = eval_model(volumes_val, mask_ratio=current_mask_ratio)
+
+                    if torch.isnan(loss_val):
+                        print(f"NaN validation loss detected at epoch {epoch+1} for a batch. Skipping batch.")
+                        continue
+                    val_loss += loss_val.item()
+                    progress_bar_val.set_postfix(loss=loss_val.item())
+        
+            avg_val_loss = val_loss / len(val_loader) if len(val_loader) > 0 else 0
+            print(f"Epoch {epoch+1}/{args.epochs} (Mask {current_mask_ratio*100:.0f}%) - Validation Loss (EMA): {avg_val_loss:.4f}")
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            log_dict = {
+                "epoch": epoch + 1, "train_loss": avg_train_loss, "val_loss": avg_val_loss,
+                "mask_ratio": current_mask_ratio, "learning_rate": optimizer.param_groups[0]['lr'],
+                **log_data_characteristic # Add our new log item
+            }
+            if epoch == 0 or (epoch + 1) % args.vis_interval == 0 or epoch == args.epochs - 1:
+                print(f"  Generating reconstructions for epoch {epoch + 1}...")
+                try:
+                    # Use EMA model for visualization
+                    vis_model = ema_model.get_model() if ema_model else model
+                    # Log 3D point clouds from within visualize_reconstructions
+                    # It now returns lists of 2D image paths and a summary path
+                    train_orig_paths, train_recon_paths, train_summary_path = visualize_reconstructions(
+                        vis_model, vis_train_loader, device, epoch + 1, current_mask_ratio, "train", args.vis_samples
+                    )
+                    if train_orig_paths:
+                        log_dict["train_originals_detailed"] = [wandb.Image(p, caption=f"Train Orig E{epoch+1} S{i}") for i, p in enumerate(train_orig_paths)]
+                    if train_recon_paths:
+                        log_dict["train_reconstructions_detailed"] = [wandb.Image(p, caption=f"Train Recon E{epoch+1} S{i}") for i, p in enumerate(train_recon_paths)]
+                    if train_summary_path:
+                        log_dict["train_summary_comparison"] = wandb.Image(train_summary_path, caption=f"Train Summary E{epoch+1}")
+
+                    val_orig_paths, val_recon_paths, val_summary_path = visualize_reconstructions(
+                        vis_model, vis_val_loader, device, epoch + 1, current_mask_ratio, "val", args.vis_samples
+                    )
+                    if val_orig_paths:
+                        log_dict["val_originals_detailed"] = [wandb.Image(p, caption=f"Val Orig E{epoch+1} S{i}") for i, p in enumerate(val_orig_paths)]
+                    if val_recon_paths:
+                        log_dict["val_reconstructions_detailed"] = [wandb.Image(p, caption=f"Val Recon E{epoch+1} S{i}") for i, p in enumerate(val_recon_paths)]
+                    if val_summary_path:
+                        log_dict["val_summary_comparison"] = wandb.Image(val_summary_path, caption=f"Val Summary E{epoch+1}")
+                        
+                except Exception as e:
+                    print(f"  Visualization failed for epoch {epoch + 1}: {e}")
+            wandb.log(log_dict)
+
+            if scheduler: # Check if scheduler is initialized (not in overfit_test)
+                scheduler.step()
+
+            if (epoch + 1) % args.save_interval == 0 or epoch == args.epochs - 1:
+                checkpoint_dir = os.path.join(wandb.run.dir, "checkpoints")
+                os.makedirs(checkpoint_dir, exist_ok=True)
+                checkpoint_path = os.path.join(checkpoint_dir, f"mae_membrane_epoch_{epoch+1}.pth")
+                
+                # Save both regular model and EMA model
+                checkpoint_data = {
+                    'epoch': epoch + 1, 
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(), 
+                    'loss': avg_train_loss, 
+                    'args': args
+                }
+                if ema_model is not None:
+                    checkpoint_data['ema_model_state_dict'] = ema_model.get_model().state_dict()
+                    checkpoint_data['ema_num_updates'] = ema_model.num_updates
+                
+                torch.save(checkpoint_data, checkpoint_path)
+                wandb.save(checkpoint_path)
+                print(f"Saved checkpoint (including EMA) to {checkpoint_path}")
+
     wandb.finish()
+    print("Training complete.")
 
-if __name__ == "__main__":
-    main() 
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Train 3D Masked Autoencoder on Synthetic Membrane Data")
+    
+    # Dataset parameters
+    parser.add_argument('--img_size', type=int, default=64, help='Size of the 3D images (cubic, e.g., 64 for 64x64x64)')
+    # MembraneSyntheticDataset specific
+    parser.add_argument('--num_spheres_range', type=str, default="12,15", help='Range for number of spheres (min,max)')
+    parser.add_argument('--radius_range', type=str, default="12,18", help='Range for sphere radii (min,max)')
+    parser.add_argument('--noise_level', type=float, default=0.01, help='Noise level for the synthetic data (improved from 0.001)')
+    parser.add_argument('--membrane_band_width', type=float, default=0.1, help='Membrane band width for synthetic data')
+    parser.add_argument('--train_samples', type=int, default=4096, help='Number of samples in training set')
+    parser.add_argument('--val_samples', type=int, default=512, help='Number of samples in validation set')
+    parser.add_argument('--num_added_spheres', type=str, default="4,4", help='Range for number of added spheres (min,max)')
+    parser.add_argument('--added_sphere_radii', type=str, default="5.0,5.0", help='Range for added sphere radii (min,max)')
+
+    # MAE & ViT Architecture parameters
+    parser.add_argument('--patch_size', type=str, default="16", help="Patch size for ViT (single int for cubic, or D,H,W).")
+    # Note: mae_vit_3d_small() uses fixed architecture (embed_dim=384, depth=8, etc.)
+    # The following parameters are kept for compatibility but not used by mae_vit_3d_small()
+    parser.add_argument('--embed_dim', type=int, default=768, help='Embedding dimension for ViT encoder')
+    parser.add_argument('--encoder_depth', type=int, default=12, help='Depth of ViT encoder')
+    parser.add_argument('--encoder_heads', type=int, default=12, help='Number of heads in ViT encoder')
+    parser.add_argument('--encoder_mlp_dim', type=int, default=3072, help='MLP dimension in ViT encoder')
+    parser.add_argument('--encoder_dim_head', type=int, default=64, help='Dimension per head in ViT encoder')
+    
+    parser.add_argument('--decoder_dim', type=int, default=512, help='Dimension of MAE decoder')
+    parser.add_argument('--decoder_depth', type=int, default=8, help='Depth of MAE decoder')
+    parser.add_argument('--decoder_heads', type=int, default=16, help='Number of heads in MAE decoder')
+    parser.add_argument('--decoder_dim_head', type=int, default=64, help='Dimension per head in MAE decoder')
+
+    # Training parameters
+    parser.add_argument('--epochs', type=int, default=2500, help='Number of training epochs')
+    parser.add_argument('--batch_size', type=int, default=8, help='Batch size for training (reduced default for memory efficiency)')
+    parser.add_argument('--learning_rate', type=float, default=1e-4, help='Initial learning rate for the scheduler')
+    parser.add_argument('--min_lr', type=float, default=5e-6, help='Minimum learning rate for the cosine annealing scheduler (improved from 1e-6)')
+    parser.add_argument('--warmup_epochs', type=int, default=100, help='Number of warmup epochs for the learning rate scheduler')
+    parser.add_argument('--weight_decay', type=float, default=0.02, help='Weight decay for AdamW optimizer (improved from 0.05)')
+    parser.add_argument('--num_workers', type=int, default=8, help='Number of data loading workers')
+    parser.add_argument('--use_amp', action='store_true', help='Use Automatic Mixed Precision training')
+    parser.add_argument('--grad_clip_norm', type=float, default=1.0, help='Gradient clipping norm (0 to disable)')
+    parser.add_argument('--ema_decay', type=float, default=0.9999, help='EMA decay rate for model averaging')
+    parser.add_argument('--norm_pix_loss', action='store_true', help='Use per-patch normalized pixels as loss target.')
+
+    # Logging and Saving
+    parser.add_argument('--run_name', type=str, default='mae_membrane_run_v4_ema', help='Name of the W&B run')
+    parser.add_argument('--project_name', type=str, default='mae-3d-membranes', help='Name of the W&B project')
+    parser.add_argument('--vis_interval', type=int, default=100, help='Epoch interval for visualizing reconstructions')
+    parser.add_argument('--vis_samples', type=int, default=2, help='Number of samples to visualize')
+    parser.add_argument('--save_interval', type=int, default=250, help='Epoch interval for saving model checkpoints')
+    parser.add_argument('--overfit_test', action='store_true', help='Run an overfitting test on a single sample.')
+    parser.add_argument('--model_arch', type=str, default="small", choices=["small", "base", "large", "huge", "hemibrain_optimal"], help="Model architecture to use.")
+
+    args = parser.parse_args()
+    
+    # Process range arguments
+    args.num_spheres_range = tuple(map(int, args.num_spheres_range.split(',')))
+    args.radius_range = tuple(map(int, args.radius_range.split(',')))
+    args.num_added_spheres = tuple(map(int, args.num_added_spheres.split(',')))
+    args.added_sphere_radii = tuple(map(float, args.added_sphere_radii.split(',')))
+
+    main(args) 

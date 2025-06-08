@@ -1,0 +1,6 @@
+*.err
+*.out
+wandb/
+venv/
+__pycache__/
+.ipynb_checkpoints/

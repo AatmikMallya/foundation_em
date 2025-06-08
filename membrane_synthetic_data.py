@@ -1,182 +1,181 @@
 import torch
+from torch.utils.data import Dataset
 import numpy as np
-import matplotlib.pyplot as plt
-import random
-from typing import Tuple, Optional
-from torch.utils.data import Dataset, DataLoader
-# from scipy.ndimage import gaussian_filter # Not needed for this approach
 
 class MembraneSyntheticDataset(Dataset):
-    """Generate 3D volumes with synthetic membrane-like structures (2D sheets in 3D)."""
+    def __init__(self, 
+                 volume_size=(64, 64, 64), 
+                 num_gaussians_range=(5, 15), 
+                 gaussian_sigma_range=(5, 15), 
+                 isovalue=0.5, 
+                 isoband_width=0.1, 
+                 noise_level=0.05, 
+                 num_samples=1000, 
+                 seed=42,
+                 # --- New parameters for additional spheres ---
+                 num_additional_spheres_range=(0, 0),
+                 additional_sphere_radius_range=(0, 0)):
+        """
+        Generates 3D synthetic membrane-like structures on-the-fly.
 
-    def __init__(self,
-                 num_samples: int = 1000,
-                 volume_size: Tuple[int, int, int] = (64, 64, 64),
-                 num_gaussians_range: Tuple[int, int] = (8, 15),
-                 gaussian_strength_range: Tuple[float, float] = (-1.0, 1.0),
-                 gaussian_sigma_range: Tuple[float, float] = (8.0, 16.0), # Controls feature size
-                 isovalue_center: float = 0.0, # For scalar field normalized around 0
-                 membrane_band_width: float = 0.1, # Thickness of the membrane band
-                 noise_level: Optional[float] = 0.05,
-                 normalize_final_volume: bool = True,
-                 seed: Optional[int] = None):
-        self.num_samples = num_samples
+        Args:
+            volume_size (tuple): Size of the 3D volume (depth, height, width).
+            num_gaussians_range (tuple): (min, max) number of Gaussians to sum.
+            gaussian_sigma_range (tuple): (min, max) sigma for Gaussians.
+            isovalue (float): Central value for the isoband.
+            isoband_width (float): Width of the isoband (isovalue +/- isoband_width/2).
+            noise_level (float): Standard deviation of Gaussian noise to add.
+            num_samples (int): Number of samples to generate per epoch.
+            seed (int): Base random seed for reproducibility.
+            num_additional_spheres_range (tuple): (min, max) number of small solid spheres to add.
+            additional_sphere_radius_range (tuple): (min, max) radius for the small solid spheres.
+        """
         self.volume_size = volume_size
         self.num_gaussians_range = num_gaussians_range
-        self.gaussian_strength_range = gaussian_strength_range
         self.gaussian_sigma_range = gaussian_sigma_range
-        self.isovalue_center = isovalue_center
-        self.membrane_band_width = membrane_band_width
+        self.isovalue = isovalue
+        self.isoband_width = isoband_width
         self.noise_level = noise_level
-        self.normalize_final_volume = normalize_final_volume
+        self.num_samples = num_samples
         self.seed = seed
+        self.epoch = 0  # Track current epoch for seed variation
+        self.num_additional_spheres_range = num_additional_spheres_range
+        self.additional_sphere_radius_range = additional_sphere_radius_range
 
-        if self.seed is not None:
-            np.random.seed(self.seed)
-            torch.manual_seed(self.seed)
-            random.seed(self.seed)
+    def _generate_single_sample(self, index, rng_instance):
+        """Generates a single 3D volume with a membrane-like structure."""
+        current_rng = rng_instance
 
-        self.volumes = self._generate_all_volumes()
+        D, H, W = self.volume_size
+        scalar_field = np.zeros((D, H, W), dtype=np.float32)
 
-    def _generate_all_volumes(self):
-        volumes = []
-        for i in range(self.num_samples):
-            current_seed = i + (self.seed if self.seed is not None else np.random.randint(0, 10000))
-            np.random.seed(current_seed)
-            random.seed(current_seed)
-            volumes.append(self._generate_single_volume())
-        return volumes
-
-    def _generate_single_volume(self) -> np.ndarray:
-        scalar_field = np.zeros(self.volume_size, dtype=np.float32)
-        num_gaussians = np.random.randint(self.num_gaussians_range[0], self.num_gaussians_range[1] + 1)
-
-        coords = np.indices(self.volume_size, dtype=np.float32)
+        num_gaussians = current_rng.randint(self.num_gaussians_range[0], self.num_gaussians_range[1] + 1)
 
         for _ in range(num_gaussians):
-            strength = np.random.uniform(self.gaussian_strength_range[0], self.gaussian_strength_range[1])
-            sigma_x = np.random.uniform(self.gaussian_sigma_range[0], self.gaussian_sigma_range[1])
-            sigma_y = np.random.uniform(self.gaussian_sigma_range[0], self.gaussian_sigma_range[1])
-            sigma_z = np.random.uniform(self.gaussian_sigma_range[0], self.gaussian_sigma_range[1])
+            center_d = current_rng.uniform(0, D)
+            center_h = current_rng.uniform(0, H)
+            center_w = current_rng.uniform(0, W)
+            sigma_d = current_rng.uniform(self.gaussian_sigma_range[0], self.gaussian_sigma_range[1])
+            sigma_h = current_rng.uniform(self.gaussian_sigma_range[0], self.gaussian_sigma_range[1])
+            sigma_w = current_rng.uniform(self.gaussian_sigma_range[0], self.gaussian_sigma_range[1])
+            amplitude = current_rng.uniform(0.5, 1.5) # Randomize amplitude a bit
+
+            d_coords, h_coords, w_coords = np.ogrid[:D, :H, :W]
             
-            center_d = np.random.uniform(0, self.volume_size[0])
-            center_h = np.random.uniform(0, self.volume_size[1])
-            center_w = np.random.uniform(0, self.volume_size[2])
+            # Anisotropic Gaussian
+            gaussian = amplitude * np.exp(-(
+                ((d_coords - center_d)**2 / (2 * sigma_d**2)) +
+                ((h_coords - center_h)**2 / (2 * sigma_h**2)) +
+                ((w_coords - center_w)**2 / (2 * sigma_w**2))
+            ))
+            scalar_field += gaussian
 
-            g = strength * np.exp(-
-                (((coords[0] - center_d)**2) / (2 * sigma_z**2)) -
-                (((coords[1] - center_h)**2) / (2 * sigma_y**2)) -
-                (((coords[2] - center_w)**2) / (2 * sigma_x**2))
-            )
-            scalar_field += g
+        # Normalize scalar field (e.g., to [0, 1] or mean 0, std 1)
+        if np.max(scalar_field) > np.min(scalar_field):
+            scalar_field = (scalar_field - np.min(scalar_field)) / (np.max(scalar_field) - np.min(scalar_field))
+        else:
+            scalar_field.fill(0) # Avoid division by zero if field is flat
 
-        # Normalize scalar field to be roughly centered around 0 with std dev 1 (or just range normalize)
-        if np.std(scalar_field) > 1e-6:
-             scalar_field = (scalar_field - np.mean(scalar_field)) / np.std(scalar_field)
+        # Define membrane as an isoband
+        lower_bound = self.isovalue - self.isoband_width / 2
+        upper_bound = self.isovalue + self.isoband_width / 2
+        membrane = np.logical_and(scalar_field >= lower_bound, scalar_field <= upper_bound).astype(np.float32)
+
+        # --- Add additional small spheres ---
+        if self.num_additional_spheres_range[1] > 0 and self.additional_sphere_radius_range[1] > 0:
+            num_spheres = current_rng.randint(self.num_additional_spheres_range[0], self.num_additional_spheres_range[1] + 1)
+            d_coords, h_coords, w_coords = np.ogrid[:D, :H, :W] # Re-use coordinates
+            for _ in range(num_spheres):
+                center_d = current_rng.uniform(0, D)
+                center_h = current_rng.uniform(0, H)
+                center_w = current_rng.uniform(0, W)
+                radius = current_rng.uniform(self.additional_sphere_radius_range[0], self.additional_sphere_radius_range[1])
+                
+                # Create a solid sphere
+                sphere_mask = ((d_coords - center_d)**2 + (h_coords - center_h)**2 + (w_coords - center_w)**2) < radius**2
+                membrane[sphere_mask] = 1.0 # Add sphere to the volume
+
+        # Add noise
+        if self.noise_level > 0:
+            noise = current_rng.normal(0, self.noise_level, size=self.volume_size).astype(np.float32)
+            membrane += noise
+            membrane = np.clip(membrane, 0, 1) # Keep values in a reasonable range after noise
         
-        # Create membrane mask from isoband
-        lower_bound = self.isovalue_center - self.membrane_band_width / 2
-        upper_bound = self.isovalue_center + self.membrane_band_width / 2
-        membrane_mask = (scalar_field >= lower_bound) & (scalar_field <= upper_bound)
-        
-        volume = membrane_mask.astype(np.float32)
-
-        if self.noise_level is not None and self.noise_level > 0:
-            volume += np.random.normal(0, self.noise_level, self.volume_size)
-            volume = np.clip(volume, 0.0, 1.0) # Clip after adding noise
-
-        if self.normalize_final_volume:
-            # This normalization might not be strictly necessary if mask is 0 or 1 and noise is small
-            # but good for consistency if noise is large or future non-binary membranes.
-            vol_min, vol_max = volume.min(), volume.max()
-            if vol_max > vol_min + 1e-6:
-                volume = (volume - vol_min) / (vol_max - vol_min)
-        
-        return np.clip(volume, 0.0, 1.0)
+        # Reshape to (1, D, H, W) for channel dimension
+        return torch.from_numpy(membrane).unsqueeze(0)
 
     def __len__(self):
         return self.num_samples
 
     def __getitem__(self, idx):
-        volume_np = self.volumes[idx]
-        return torch.from_numpy(volume_np.copy()).unsqueeze(0) # Add channel dim
+        # Generate seed based on epoch and index to ensure different data each epoch
+        seed = self.seed + self.epoch * self.num_samples + idx
+        rng = np.random.RandomState(seed)
+        return self._generate_single_sample(idx, rng_instance=rng)
 
-    def visualize_sample(self, idx: int = 0, slice_axis: int = 0, slice_idx: Optional[int] = None):
-        volume_np = self.volumes[idx]
-        if slice_idx is None:
-            slice_idx = volume_np.shape[slice_axis] // 2
+    def set_epoch(self, epoch):
+        """ 
+        Sets the current epoch. This is crucial for generating different data
+        each epoch when using on-the-fly generation.
+        """
+        self.epoch = epoch
 
-        slice_2d = np.take(volume_np, slice_idx, axis=slice_axis)
-        title = f"Membrane Sample {idx}, Slice {('Z','Y','X')[slice_axis]}={slice_idx}, Range: [{volume_np.min():.2f}-{volume_np.max():.2f}]"
-        
-        plt.figure(figsize=(8, 8))
-        plt.imshow(slice_2d, cmap='gray', vmin=0, vmax=1)
-        plt.title(title)
-        plt.colorbar()
-        plt.show()
+from torch.utils.data import DataLoader
 
-def create_membrane_dataloader(batch_size: int = 4,
-                               num_samples: int = 1000,
-                               volume_size: Tuple[int, int, int] = (64, 64, 64),
-                               num_gaussians_range: Tuple[int, int] = (8, 15),
-                               gaussian_strength_range: Tuple[float, float] = (-1.0, 1.0),
-                               gaussian_sigma_range: Tuple[float, float] = (8.0, 16.0),
-                               isovalue_center: float = 0.0,
-                               membrane_band_width: float = 0.1,
-                               noise_level: Optional[float] = 0.05,
-                               num_workers: int = 0,
-                               shuffle: bool = True,
-                               seed: Optional[int] = None) -> DataLoader:
+def create_membrane_dataloader(batch_size, num_samples, volume_size, 
+                               num_gaussians_range, gaussian_sigma_range, 
+                               noise_level, membrane_band_width, 
+                               num_workers, shuffle, seed, 
+                               drop_last=True,
+                               # Kwargs for additional features
+                               **kwargs):
+    """
+    Creates a DataLoader for the MembraneSyntheticDataset with on-the-fly generation.
+    """
+    # Extract sphere arguments from kwargs, with defaults
+    num_additional_spheres_range = kwargs.get('num_additional_spheres_range', (0,0))
+    additional_sphere_radius_range = kwargs.get('additional_sphere_radius_range', (0,0))
+
     dataset = MembraneSyntheticDataset(
-        num_samples=num_samples, volume_size=volume_size,
+        volume_size=volume_size,
         num_gaussians_range=num_gaussians_range,
-        gaussian_strength_range=gaussian_strength_range,
         gaussian_sigma_range=gaussian_sigma_range,
-        isovalue_center=isovalue_center,
-        membrane_band_width=membrane_band_width,
+        isoband_width=membrane_band_width, # Mapping argument name
         noise_level=noise_level,
-        normalize_final_volume=True, seed=seed
+        num_samples=num_samples,
+        seed=seed,
+        num_additional_spheres_range=num_additional_spheres_range,
+        additional_sphere_radius_range=additional_sphere_radius_range
     )
-    return DataLoader(
-        dataset, batch_size=batch_size, shuffle=shuffle,
-        num_workers=num_workers, pin_memory=torch.cuda.is_available()
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=True, # Recommended for GPU training
+        drop_last=drop_last   # Use parameter instead of hardcoded True
     )
+    return dataloader
 
 if __name__ == '__main__':
-    print("Generating synthetic membrane dataset (sheet-like structures)...")
-    dataset = MembraneSyntheticDataset(
-        num_samples=5,
-        volume_size=(64, 64, 64),
-        num_gaussians_range=(10, 20),      # More gaussians for complexity
-        gaussian_strength_range=(-1.0, 1.0),
-        gaussian_sigma_range=(10.0, 20.0), # Larger sigmas for broader features
-        isovalue_center=0.0,               # Center of the band in normalized scalar field
-        membrane_band_width=0.15,          # Relatively thin membrane band
-        noise_level=0.02,                  # Slight noise on final image
-        seed=42
+    # Example usage:
+    train_loader_example = create_membrane_dataloader(
+        batch_size=2,
+        num_samples=10,
+        volume_size=(32,32,32),
+        num_gaussians_range=(3,8),
+        gaussian_sigma_range=(3,10),
+        noise_level=0.01,
+        membrane_band_width=0.2,
+        num_workers=0,
+        shuffle=True,
+        seed=42,
+        # Example of passing args
+        num_additional_spheres_range=(2, 5), 
+        additional_sphere_radius_range=(2.0, 4.0)
     )
-    print(f"Dataset generated with {len(dataset)} samples.")
 
-    if len(dataset) > 0:
-        print(f"Visualizing sample 0...")
-        try:
-            dataset.visualize_sample(idx=0, slice_axis=0) # Z-slice
-            dataset.visualize_sample(idx=0, slice_axis=1) # Y-slice
-            dataset.visualize_sample(idx=0, slice_axis=2) # X-slice
-            
-            if len(dataset) > 1:
-                 print(f"\nVisualizing sample 1...")
-                 dataset.visualize_sample(idx=1, slice_axis=0) 
-        except Exception as e:
-            print(f"Matplotlib visualization failed: {e}")
-    
-    print("\nTesting DataLoader...")
-    dataloader = create_membrane_dataloader(
-        batch_size=2, num_samples=4, volume_size=(32,32,32), # Smaller for quick test
-        membrane_band_width=0.2, seed=43, num_gaussians_range=(5,10)
-    )
-    for batch_idx, batch in enumerate(dataloader):
-        print(f"Batch {batch_idx}: shape {batch.shape}, range [{batch.min():.3f}, {batch.max():.3f}], dtype {batch.dtype}")
-        if batch_idx >= 1: break
-    
-    print("Synthetic membrane data generation (sheets) test completed!") 
+    print(f"Created DataLoader. Number of batches: {len(train_loader_example)}")
+    first_batch = next(iter(train_loader_example))
+    print(f"First batch shape: {first_batch.shape}")
+    print(f"First batch data type: {first_batch.dtype}")

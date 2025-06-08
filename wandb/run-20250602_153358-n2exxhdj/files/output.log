@@ -1,5 +1,0 @@
-Warning: Conv3D not supported on this MPS version, falling back to CPU
-Using device: cpu
-
-Starting training on membrane data for 200 epochs...
-Epoch 1 (Mask 50%):  95%|██████████████████ | 237/250 [05:54<00:18,  1.46s/it, loss=0.0625, avg_loss=0.0833]
