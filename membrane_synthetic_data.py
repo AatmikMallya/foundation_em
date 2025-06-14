@@ -76,7 +76,7 @@ class MembraneSyntheticDataset(Dataset):
         # Profile gaussian field generation
         if _data_generation_profiler is not None:
             with _data_generation_profiler.profile_section("gaussian_field_generation"):
-                scalar_field = np.zeros((D, H, W), dtype=np.float32)
+        scalar_field = np.zeros((D, H, W), dtype=np.float32)
                 num_gaussians = current_rng.randint(self.num_gaussians_range[0], self.num_gaussians_range[1] + 1)
 
                 for _ in range(num_gaussians):
@@ -99,26 +99,26 @@ class MembraneSyntheticDataset(Dataset):
                     scalar_field += gaussian
         else:
             scalar_field = np.zeros((D, H, W), dtype=np.float32)
-            num_gaussians = current_rng.randint(self.num_gaussians_range[0], self.num_gaussians_range[1] + 1)
+        num_gaussians = current_rng.randint(self.num_gaussians_range[0], self.num_gaussians_range[1] + 1)
 
-            for _ in range(num_gaussians):
-                center_d = current_rng.uniform(0, D)
-                center_h = current_rng.uniform(0, H)
-                center_w = current_rng.uniform(0, W)
-                sigma_d = current_rng.uniform(self.gaussian_sigma_range[0], self.gaussian_sigma_range[1])
-                sigma_h = current_rng.uniform(self.gaussian_sigma_range[0], self.gaussian_sigma_range[1])
-                sigma_w = current_rng.uniform(self.gaussian_sigma_range[0], self.gaussian_sigma_range[1])
-                amplitude = current_rng.uniform(0.5, 1.5) # Randomize amplitude a bit
+        for _ in range(num_gaussians):
+            center_d = current_rng.uniform(0, D)
+            center_h = current_rng.uniform(0, H)
+            center_w = current_rng.uniform(0, W)
+            sigma_d = current_rng.uniform(self.gaussian_sigma_range[0], self.gaussian_sigma_range[1])
+            sigma_h = current_rng.uniform(self.gaussian_sigma_range[0], self.gaussian_sigma_range[1])
+            sigma_w = current_rng.uniform(self.gaussian_sigma_range[0], self.gaussian_sigma_range[1])
+            amplitude = current_rng.uniform(0.5, 1.5) # Randomize amplitude a bit
 
-                d_coords, h_coords, w_coords = np.ogrid[:D, :H, :W]
-                
-                # Anisotropic Gaussian
-                gaussian = amplitude * np.exp(-(
-                    ((d_coords - center_d)**2 / (2 * sigma_d**2)) +
-                    ((h_coords - center_h)**2 / (2 * sigma_h**2)) +
-                    ((w_coords - center_w)**2 / (2 * sigma_w**2))
-                ))
-                scalar_field += gaussian
+            d_coords, h_coords, w_coords = np.ogrid[:D, :H, :W]
+            
+            # Anisotropic Gaussian
+            gaussian = amplitude * np.exp(-(
+                ((d_coords - center_d)**2 / (2 * sigma_d**2)) +
+                ((h_coords - center_h)**2 / (2 * sigma_h**2)) +
+                ((w_coords - center_w)**2 / (2 * sigma_w**2))
+            ))
+            scalar_field += gaussian
 
         # Normalize scalar field to [0, 1] range - single normalization step
         if np.max(scalar_field) > np.min(scalar_field):
