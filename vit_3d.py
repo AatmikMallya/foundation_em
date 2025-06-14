@@ -266,6 +266,7 @@ class MaskedAutoencoderViT3D(nn.Module):
         # --------------------------------------------------------------------------
 
         self.norm_pix_loss = norm_pix_loss
+        self.mask_ratio = mask_ratio  # CRITICAL FIX: Store mask_ratio as instance attribute
 
         self.init_weights()
 

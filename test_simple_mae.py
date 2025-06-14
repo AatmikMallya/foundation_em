@@ -183,7 +183,9 @@ def main():
     )
     
     model = mae_vit_3d_small(
-        volume_size=config['volume_size'], patch_size=config['patch_size'],
+        volume_size=config['volume_size'], 
+        patch_size=config['patch_size'],
+        mask_ratio=config['initial_mask_ratio']  # Set initial mask ratio properly
     ).to(device)
     wandb.watch(model, log_freq=100) # Log model gradients and parameters
 

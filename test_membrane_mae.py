@@ -291,17 +291,18 @@ def main(args):
     model = model_fn(
         volume_size=(args.img_size, args.img_size, args.img_size),
         patch_size=patch_size,
-        norm_pix_loss=args.norm_pix_loss
+        norm_pix_loss=args.norm_pix_loss,
+        mask_ratio=args.initial_masking_ratio  # CRITICAL FIX: Set initial mask ratio properly
     ).to(device)
 
     # print the image size
     print(f"Image size: {args.img_size}")
 
-    # Compile model for better performance (PyTorch 2.0+)
-    # No fallback: if compilation fails, the job should fail.
-    print("Compiling model with torch.compile for improved performance...")
-    model = torch.compile(model, mode='default')
-    print("Model compilation successful.")
+    # DISABLED: Model compilation can cause issues with complex 3D MAE operations
+    # print("Compiling model with torch.compile for improved performance...")
+    # model = torch.compile(model, mode='default')
+    # print("Model compilation successful.")
+    print("Model compilation DISABLED to avoid potential issues with 3D MAE operations.")
     
     wandb.watch(model, log_freq=100)
     # Optimizer now uses learning rate from args
@@ -596,19 +597,19 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Train 3D Masked Autoencoder on Synthetic Membrane Data")
     
     # Dataset parameters
-    parser.add_argument('--img_size', type=int, default=64, help='Size of the 3D images (cubic, e.g., 64 for 64x64x64)')
-    # MembraneSyntheticDataset specific
-    parser.add_argument('--num_spheres_range', type=str, default="12,15", help='Range for number of spheres (min,max)')
-    parser.add_argument('--radius_range', type=str, default="12,18", help='Range for sphere radii (min,max)')
-    parser.add_argument('--noise_level', type=float, default=0.01, help='Noise level for the synthetic data (improved from 0.001)')
-    parser.add_argument('--membrane_band_width', type=float, default=0.1, help='Membrane band width for synthetic data')
+    parser.add_argument('--img_size', type=int, default=96, help='Size of the 3D images (cubic, e.g., 96 for 96x96x96) - OPTIMIZED for 16^3 patches')
+    # MembraneSyntheticDataset specific  
+    parser.add_argument('--num_spheres_range', type=str, default="7,12", help='Range for number of spheres (min,max) - INCREASED for larger volume')
+    parser.add_argument('--radius_range', type=str, default="10,16", help='Range for sphere radii (min,max) - INCREASED for larger volume')
+    parser.add_argument('--noise_level', type=float, default=0.005, help='Noise level for the synthetic data - REDUCED for easier learning')
+    parser.add_argument('--membrane_band_width', type=float, default=0.15, help='Membrane band width for synthetic data - INCREASED for thicker membranes')
     parser.add_argument('--train_samples', type=int, default=4096, help='Number of samples in training set')
     parser.add_argument('--val_samples', type=int, default=512, help='Number of samples in validation set')
     parser.add_argument('--num_added_spheres', type=str, default="4,4", help='Range for number of added spheres (min,max)')
     parser.add_argument('--added_sphere_radii', type=str, default="5.0,5.0", help='Range for added sphere radii (min,max)')
 
     # MAE & ViT Architecture parameters
-    parser.add_argument('--patch_size', type=str, default="16", help="Patch size for ViT (single int for cubic, or D,H,W).")
+    parser.add_argument('--patch_size', type=str, default="16", help="Patch size for ViT (single int for cubic, or D,H,W). OPTIMIZED: 16^3 patches for 96^3 volumes = 6x6x6 = 216 patches.")
     # Note: mae_vit_3d_small() uses fixed architecture (embed_dim=384, depth=8, etc.)
     # The following parameters are kept for compatibility but not used by mae_vit_3d_small()
     parser.add_argument('--embed_dim', type=int, default=768, help='Embedding dimension for ViT encoder')
@@ -630,8 +631,8 @@ if __name__ == '__main__':
     parser.add_argument('--norm_pix_loss', action='store_true', help='Use per-patch normalized pixels as loss target.')
 
     # Initial and final masking ratio
-    parser.add_argument('--initial_masking_ratio', type=float, default=0.40, help='Initial masking ratio')
-    parser.add_argument('--final_masking_ratio', type=float, default=0.40, help='Final masking ratio')
+    parser.add_argument('--initial_masking_ratio', type=float, default=0.30, help='Initial masking ratio')
+    parser.add_argument('--final_masking_ratio', type=float, default=0.30, help='Final masking ratio')
 
     # Logging and Saving
     parser.add_argument('--run_name', type=str, default='mae_membrane_run_v4_ema', help='Name of the W&B run')
