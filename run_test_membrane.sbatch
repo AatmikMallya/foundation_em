@@ -7,7 +7,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8         # Adjust as needed, 4 is a good starting point
 #SBATCH --mem-per-cpu=4G          # Adjust as needed, 16GB total for the job
-#SBATCH --time=12:15:00           # Updated time limit to 48 hours
+#SBATCH --time=1-00:00:00           # Updated time limit to 48 hours
 #SBATCH --partition=scavenge_gpu  # Or your specific GPU partition
 #SBATCH --gpus=a5000:1             # Request 1 A5000 GPU
 
@@ -25,7 +25,7 @@ echo "--- nvidia-smi (from job script) ---"
 nvidia-smi
 echo "------------------------------------"
 python3 test_membrane_mae.py \
-    --run_name "mae_hemi_optimal_norm_dynamic_data_fixed" \
+    --run_name "mae_img_64_mask_40_new_data" \
     --model_arch hemibrain_optimal \
     --epochs 4000 \
     --batch_size 64 \
@@ -37,7 +37,7 @@ python3 test_membrane_mae.py \
     --use_amp \
     --norm_pix_loss \
     --vis_interval 100 \
-    --save_interval 250 \
+    --save_interval 2500000 \
     --num_workers 8
 
 echo "Python script finished."

@@ -42,7 +42,7 @@ def test_model_components():
     # Test forward pass
     model.eval()
     with torch.no_grad():
-        loss, pred, mask = model(test_vol)
+        loss, pred, mask, _ = model(test_vol)
         reconstructed = model.unpatchify(pred)
         
         print(f"Loss: {loss.item():.4f}")
@@ -95,7 +95,7 @@ def test_different_mask_ratios():
         ).to(device)
         model.eval()
         with torch.no_grad():
-            loss, pred, mask = model(test_vol)
+            loss, pred, mask, _ = model(test_vol)
             reconstructed = model.unpatchify(pred)
             
             original = test_vol[0, 0].cpu().numpy().flatten()
@@ -162,7 +162,7 @@ def test_simple_training():
             volumes = volumes.to(device)
             
             optimizer.zero_grad()
-            loss, pred, mask = model(volumes)
+            loss, pred, mask, _ = model(volumes)
             loss.backward()
             optimizer.step()
             
@@ -176,7 +176,7 @@ def test_simple_training():
         model.eval()
         with torch.no_grad():
             test_vol_eval = fixed_dataset.sphere_volume.unsqueeze(0).to(device)
-            loss_eval, pred_eval, mask_eval = model(test_vol_eval)
+            loss_eval, pred_eval, mask_eval, _ = model(test_vol_eval)
             reconstructed_eval = model.unpatchify(pred_eval)
             original_eval = test_vol_eval[0, 0].cpu().numpy().flatten()
             recon_eval = reconstructed_eval[0, 0].cpu().numpy().flatten()
@@ -189,7 +189,7 @@ def test_simple_training():
     model.eval()
     with torch.no_grad():
         test_vol = fixed_dataset.sphere_volume.unsqueeze(0).to(device)
-        loss, pred, mask = model(test_vol)
+        loss, pred, mask, _ = model(test_vol)
         reconstructed = model.unpatchify(pred)
         
         original = test_vol[0, 0].cpu().numpy().flatten()

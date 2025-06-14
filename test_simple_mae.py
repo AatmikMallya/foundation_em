@@ -25,7 +25,7 @@ def train_mae_one_epoch(model, dataloader, optimizer, device, epoch, mask_ratio)
         volumes = volumes.to(device)
         
         # Forward pass with current epoch's mask_ratio
-        loss, pred, mask = model(volumes, mask_ratio=mask_ratio)
+        loss, pred, mask, _ = model(volumes, mask_ratio=mask_ratio)
         
         # Backward pass
         optimizer.zero_grad()
@@ -52,7 +52,7 @@ def evaluate_mae(model, dataloader, device, mask_ratio):
     with torch.no_grad():
         for volumes in dataloader:
             volumes = volumes.to(device)
-            loss, pred, mask = model(volumes, mask_ratio=mask_ratio)
+            loss, pred, mask, _ = model(volumes, mask_ratio=mask_ratio)
             total_loss += loss.item()
             
     return total_loss / num_batches
@@ -65,7 +65,7 @@ def visualize_reconstruction_detailed(model, dataloader, device, epoch, mask_rat
     with torch.no_grad():
         volumes = next(iter(dataloader)).to(device)
         # Use a fixed mask ratio for consistent visualization if needed, or current epoch's
-        loss, pred, mask = model(volumes, mask_ratio=mask_ratio) 
+        loss, pred, mask, _ = model(volumes, mask_ratio=mask_ratio) 
         
         original_volume = volumes[0, 0].cpu().numpy()
         reconstructed_volume_patches = model.unpatchify(pred.cpu())
@@ -116,7 +116,7 @@ def check_learning_progress(model, device, mask_ratio_eval=0.75):
                     if (i_idx-center)**2 + (j_idx-center)**2 + (k_idx-center)**2 <= radius**2:
                         test_vol[0, 0, i_idx, j_idx, k_idx] = 1.0
         
-        loss, pred, mask = model(test_vol, mask_ratio=mask_ratio_eval) # Evaluate with a fixed high mask ratio
+        loss, pred, mask, _ = model(test_vol, mask_ratio=mask_ratio_eval) # Evaluate with a fixed high mask ratio
         reconstructed = model.unpatchify(pred)
         
         original_sphere_flat = test_vol[0, 0].cpu().numpy().flatten()

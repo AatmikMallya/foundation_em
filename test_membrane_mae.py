@@ -63,24 +63,30 @@ def get_lr_scheduler_with_warmup(optimizer, warmup_epochs, total_epochs, min_lr=
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 # --- New Progressive Mask Schedule ---
-def get_progressive_mask_ratio(epoch, 
-                               warmup_mask_ratio=0.75, warmup_mask_epochs=200,
-                               ramp_start_epoch=201, ramp_end_epoch=1000, 
-                               min_ramp_mask_ratio=0.75, max_ramp_mask_ratio=0.75,
-                               final_mask_ratio=0.75):
+def get_progressive_mask_ratio(epoch, total_epochs,
+                               initial_ratio, final_ratio,
+                               warmup_phase=0.1, ramp_phase=0.3):
     """
-    Calculates the mask ratio based on the current epoch.
-    Phase 1: Constant low mask ratio during warmup.
-    Phase 2: Gradual linear increase in mask ratio.
-    Phase 3: Constant high mask ratio for refinement.
+    Calculates the mask ratio for a given epoch based on a progressive schedule
+    ideal for learning both fine details and global context.
+
+    Phase 1: Warmup with a low mask ratio to learn local features.
+    Phase 2: Ramp up the difficulty to learn context.
+    Phase 3: Cooldown with a high mask ratio to refine global structure.
     """
-    if epoch <= warmup_mask_epochs:
-        return warmup_mask_ratio
-    elif epoch <= ramp_end_epoch: # ramp_start_epoch is implicitly handled
-        progress_in_ramp = float(epoch - warmup_mask_epochs) / float(max(1, ramp_end_epoch - warmup_mask_epochs))
-        return min_ramp_mask_ratio + progress_in_ramp * (max_ramp_mask_ratio - min_ramp_mask_ratio)
+    warmup_epochs = int(total_epochs * warmup_phase)
+    ramp_epochs = int(total_epochs * ramp_phase)
+    
+    if epoch < warmup_epochs:
+        # Phase 1: Constant low mask ratio
+        return initial_ratio
+    elif epoch < warmup_epochs + ramp_epochs:
+        # Phase 2: Linearly ramp up the mask ratio
+        progress_in_ramp = (epoch - warmup_epochs) / ramp_epochs
+        return initial_ratio + progress_in_ramp * (final_ratio - initial_ratio)
     else:
-        return final_mask_ratio
+        # Phase 3: Constant high mask ratio
+        return final_ratio
 
 def visualize_reconstructions(model, dataloader, device, epoch, mask_ratio, dataset_name, num_examples=5, save_dir="membrane_visualizations"):
     """Visualize reconstructions, log 3D point clouds for the first example, and return paths for 2D images."""
@@ -100,10 +106,16 @@ def visualize_reconstructions(model, dataloader, device, epoch, mask_ratio, data
             if examples_shown >= num_examples:
                 break
             volumes_to_device = batch_volumes.to(device)
-            # Assuming model returns: loss, predicted_volumes (patchified), mask
-            loss_batch, pred_batch, _ = model(volumes_to_device, mask_ratio=mask_ratio) 
+            # Model now returns: loss, predicted_volumes (patchified), mask, patch_stats
+            loss_batch, pred_batch, _, patch_stats = model(volumes_to_device, mask_ratio=mask_ratio)
+            
+            # Denormalize predictions if norm_pix_loss is enabled
+            pred_for_unpatchify = pred_batch.cpu()
+            if patch_stats is not None:
+                mean, var = patch_stats
+                pred_for_unpatchify = pred_for_unpatchify * (var.add(1.e-6).sqrt()).cpu() + mean.cpu()
         
-            reconstructed_batch_np = model.unpatchify(pred_batch.cpu()).numpy()
+            reconstructed_batch_np = model.unpatchify(pred_for_unpatchify).numpy()
             original_batch_np = batch_volumes.cpu().numpy() # Keep originals on CPU
 
             for i in range(volumes_to_device.size(0)):
@@ -222,6 +234,10 @@ def visualize_reconstructions(model, dataloader, device, epoch, mask_ratio, data
 def main(args):
     device = get_device()
     print(f"Using device: {device}")
+    
+    # Initialize training profiler
+    from training_profiler import TrainingProfiler
+    profiler = TrainingProfiler(log_interval=5, memory_tracking=True, detailed_timing=True)
 
     # Parameters are now controlled via argparse defaults and command-line arguments
     # for better flexibility and experiment tracking.
@@ -268,7 +284,10 @@ def main(args):
         patch_size=patch_size,
         norm_pix_loss=args.norm_pix_loss
     ).to(device)
-    
+
+    # print the image size
+    print(f"Image size: {args.img_size}")
+
     # Compile model for better performance (PyTorch 2.0+)
     # No fallback: if compilation fails, the job should fail.
     print("Compiling model with torch.compile for improved performance...")
@@ -328,7 +347,7 @@ def main(args):
         model.train()
         for iteration in tqdm(range(num_overfit_iterations), desc="Overfitting to one sample"):
             optimizer.zero_grad()
-            loss, _, _ = model(single_volume, mask_ratio=overfit_mask_ratio)
+            loss, _, _, _ = model(single_volume, mask_ratio=overfit_mask_ratio)
             if torch.isnan(loss):
                 print(f"NaN loss at iteration {iteration+1}. Stopping overfit test.")
                 break
@@ -393,14 +412,19 @@ def main(args):
             drop_last=False  # Don't drop validation batches for visualization
         )
         
+        # print the initial and final masking ratio
+        print(f"Initial masking ratio: {args.initial_masking_ratio}")
+        print(f"Final masking ratio: {args.final_masking_ratio}")
+        
         print(f"Starting training on membrane data for {args.epochs} epochs...")
         for epoch in range(args.epochs):
             # Get current mask ratio from the new schedule
-            current_mask_ratio = get_progressive_mask_ratio(epoch + 1) # epoch + 1 for 1-indexed
+            current_mask_ratio = get_progressive_mask_ratio(epoch + 1, args.epochs, args.initial_masking_ratio, args.final_masking_ratio) # epoch + 1 for 1-indexed
             
-            # --- On-the-fly data generation ---
-            # The set_epoch call is crucial to ensure that each epoch gets
-            # a new, unique set of generated samples.
+                    # --- On-the-fly data generation ---
+        # The set_epoch call is crucial to ensure that each epoch gets
+        # a new, unique set of generated samples.
+        with profiler.profile_section("data_epoch_setup"):
             train_loader.dataset.set_epoch(epoch)
             # We also set the epoch for the visualization loader to be consistent
             vis_train_loader.dataset.set_epoch(epoch)
@@ -415,42 +439,60 @@ def main(args):
             progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Training] (Mask {current_mask_ratio*100:.0f}%)", unit="batch")
             
             for batch_idx, volumes in enumerate(progress_bar):
+                # Start profiling this batch
+                profiler.start_batch_timing()
+                
                 if batch_idx == 0: # Capture the first batch
                     first_batch_for_logging = volumes.detach().cpu().clone() # Ensure it's on CPU and a copy
 
-                volumes = volumes.to(device)
-                if volumes.ndim == 4: volumes = volumes.unsqueeze(1)
+                # Profile data transfer to GPU
+                with profiler.profile_section("data_transfer"):
+                    volumes = profiler.profile_data_transfer(volumes, device)
+                    if volumes.ndim == 4: volumes = volumes.unsqueeze(1)
 
-                optimizer.zero_grad(set_to_none=True)
+                with profiler.profile_section("optimizer_zero_grad"):
+                    optimizer.zero_grad(set_to_none=True)
                 
                 if args.use_amp and scaler:
-                    with torch.cuda.amp.autocast():
-                        loss, _, _ = model(volumes, mask_ratio=current_mask_ratio)
+                    with profiler.profile_section("forward_pass_amp"):
+                        with torch.cuda.amp.autocast():
+                            loss, _, _, _ = model(volumes, mask_ratio=current_mask_ratio)
                     if torch.isnan(loss):
                         print(f"NaN loss detected at epoch {epoch+1}, batch {batch_idx} (AMP). Skipping batch.")
                         continue
-                    scaler.scale(loss).backward()
-                    if args.grad_clip_norm > 0:
-                        scaler.unscale_(optimizer)
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
-                    scaler.step(optimizer)
-                    scaler.update()
+                    with profiler.profile_section("backward_pass_amp"):
+                        scaler.scale(loss).backward()
+                    with profiler.profile_section("gradient_clipping"):
+                        if args.grad_clip_norm > 0:
+                            scaler.unscale_(optimizer)
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
+                    with profiler.profile_section("optimizer_step_amp"):
+                        scaler.step(optimizer)
+                        scaler.update()
                 else: 
-                    loss, _, _ = model(volumes, mask_ratio=current_mask_ratio)
+                    with profiler.profile_section("forward_pass"):
+                        loss, _, _, _ = model(volumes, mask_ratio=current_mask_ratio)
                     if torch.isnan(loss):
                         print(f"NaN loss detected at epoch {epoch+1}, batch {batch_idx}. Skipping batch.")
                         continue
-                    loss.backward()
-                    if args.grad_clip_norm > 0:
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
-                    optimizer.step()
+                    with profiler.profile_section("backward_pass"):
+                        loss.backward()
+                    with profiler.profile_section("gradient_clipping"):
+                        if args.grad_clip_norm > 0:
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
+                    with profiler.profile_section("optimizer_step"):
+                        optimizer.step()
                 
                 # Update EMA model after each batch
-                if ema_model is not None:
-                    ema_model.update(model)
+                with profiler.profile_section("ema_update"):
+                    if ema_model is not None:
+                        ema_model.update(model)
             
                 epoch_loss += loss.item()
                 progress_bar.set_postfix(loss=loss.item(), lr=optimizer.param_groups[0]['lr'], mask=f"{current_mask_ratio:.2f}")
+                
+                # End batch profiling
+                profiler.end_batch_timing(batch_idx)
 
             avg_train_loss = epoch_loss / len(train_loader) if len(train_loader) > 0 else 0
             print(f"Epoch {epoch+1}/{args.epochs} (Mask {current_mask_ratio*100:.0f}%) - Training Loss: {avg_train_loss:.4f}, LR: {optimizer.param_groups[0]['lr']:.6f}")
@@ -469,23 +511,26 @@ def main(args):
             # --- End log data characteristic ---
 
             # Validation using EMA model if available
-            eval_model = ema_model.get_model() if ema_model else model
-            eval_model.eval()
-            val_loss = 0
-            progress_bar_val = tqdm(val_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Validation] (Mask {current_mask_ratio*100:.0f}%)", unit="batch")
-            with torch.no_grad():
-                for volumes_val in progress_bar_val:
-                    volumes_val = volumes_val.to(device)
-                    if volumes_val.ndim == 4: volumes_val = volumes_val.unsqueeze(1)
-                
-                    with torch.cuda.amp.autocast(enabled=args.use_amp):
-                        loss_val, _, _ = eval_model(volumes_val, mask_ratio=current_mask_ratio)
+            with profiler.profile_section("validation_epoch"):
+                eval_model = ema_model.get_model() if ema_model else model
+                eval_model.eval()
+                val_loss = 0
+                progress_bar_val = tqdm(val_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Validation] (Mask {current_mask_ratio*100:.0f}%)", unit="batch")
+                with torch.no_grad():
+                    for volumes_val in progress_bar_val:
+                        with profiler.profile_section("validation_data_transfer"):
+                            volumes_val = volumes_val.to(device)
+                            if volumes_val.ndim == 4: volumes_val = volumes_val.unsqueeze(1)
+                    
+                        with profiler.profile_section("validation_forward"):
+                            with torch.cuda.amp.autocast(enabled=args.use_amp):
+                                loss_val, _, _, _ = eval_model(volumes_val, mask_ratio=current_mask_ratio)
 
-                    if torch.isnan(loss_val):
-                        print(f"NaN validation loss detected at epoch {epoch+1} for a batch. Skipping batch.")
-                        continue
-                    val_loss += loss_val.item()
-                    progress_bar_val.set_postfix(loss=loss_val.item())
+                        if torch.isnan(loss_val):
+                            print(f"NaN validation loss detected at epoch {epoch+1} for a batch. Skipping batch.")
+                            continue
+                        val_loss += loss_val.item()
+                        progress_bar_val.set_postfix(loss=loss_val.item())
         
             avg_val_loss = val_loss / len(val_loader) if len(val_loader) > 0 else 0
             print(f"Epoch {epoch+1}/{args.epochs} (Mask {current_mask_ratio*100:.0f}%) - Validation Loss (EMA): {avg_val_loss:.4f}")
@@ -501,33 +546,38 @@ def main(args):
             if epoch == 0 or (epoch + 1) % args.vis_interval == 0 or epoch == args.epochs - 1:
                 print(f"  Generating reconstructions for epoch {epoch + 1}...")
                 try:
-                    # Use EMA model for visualization
-                    vis_model = ema_model.get_model() if ema_model else model
-                    # Log 3D point clouds from within visualize_reconstructions
-                    # It now returns lists of 2D image paths and a summary path
-                    train_orig_paths, train_recon_paths, train_summary_path = visualize_reconstructions(
-                        vis_model, vis_train_loader, device, epoch + 1, current_mask_ratio, "train", args.vis_samples
-                    )
-                    if train_orig_paths:
-                        log_dict["train_originals_detailed"] = [wandb.Image(p, caption=f"Train Orig E{epoch+1} S{i}") for i, p in enumerate(train_orig_paths)]
-                    if train_recon_paths:
-                        log_dict["train_reconstructions_detailed"] = [wandb.Image(p, caption=f"Train Recon E{epoch+1} S{i}") for i, p in enumerate(train_recon_paths)]
-                    if train_summary_path:
-                        log_dict["train_summary_comparison"] = wandb.Image(train_summary_path, caption=f"Train Summary E{epoch+1}")
+                    with profiler.profile_section("visualization_generation"):
+                        # Import enhanced visualization
+                        from enhanced_visualization import enhanced_visualize_reconstructions
+                        
+                        # Use EMA model for visualization
+                        vis_model = ema_model.get_model() if ema_model else model
+                        
+                        # Enhanced visualization with color-coded patches
+                        train_enhanced_paths = enhanced_visualize_reconstructions(
+                            vis_model, vis_train_loader, device, epoch + 1, current_mask_ratio, "train", args.vis_samples
+                        )
+                        if train_enhanced_paths:
+                            log_dict["train_enhanced_visualizations"] = [
+                                wandb.Image(p, caption=f"Enhanced Train E{epoch+1} S{i} (Green=Visible, Red=Masked)") 
+                                for i, p in enumerate(train_enhanced_paths)
+                            ]
 
-                    val_orig_paths, val_recon_paths, val_summary_path = visualize_reconstructions(
-                        vis_model, vis_val_loader, device, epoch + 1, current_mask_ratio, "val", args.vis_samples
-                    )
-                    if val_orig_paths:
-                        log_dict["val_originals_detailed"] = [wandb.Image(p, caption=f"Val Orig E{epoch+1} S{i}") for i, p in enumerate(val_orig_paths)]
-                    if val_recon_paths:
-                        log_dict["val_reconstructions_detailed"] = [wandb.Image(p, caption=f"Val Recon E{epoch+1} S{i}") for i, p in enumerate(val_recon_paths)]
-                    if val_summary_path:
-                        log_dict["val_summary_comparison"] = wandb.Image(val_summary_path, caption=f"Val Summary E{epoch+1}")
+                        val_enhanced_paths = enhanced_visualize_reconstructions(
+                            vis_model, vis_val_loader, device, epoch + 1, current_mask_ratio, "val", args.vis_samples
+                        )
+                        if val_enhanced_paths:
+                            log_dict["val_enhanced_visualizations"] = [
+                                wandb.Image(p, caption=f"Enhanced Val E{epoch+1} S{i} (Green=Visible, Red=Masked)") 
+                                for i, p in enumerate(val_enhanced_paths)
+                            ]
                         
                 except Exception as e:
                     print(f"  Visualization failed for epoch {epoch + 1}: {e}")
             wandb.log(log_dict)
+            
+            # Log epoch profiling summary
+            profiler.log_epoch_summary(epoch + 1)
 
             if scheduler: # Check if scheduler is initialized (not in overfit_test)
                 scheduler.step()
@@ -553,6 +603,9 @@ def main(args):
                 wandb.save(checkpoint_path)
                 print(f"Saved checkpoint (including EMA) to {checkpoint_path}")
 
+    # Cleanup profiler
+    profiler.cleanup()
+    
     wandb.finish()
     print("Training complete.")
 
@@ -576,15 +629,9 @@ if __name__ == '__main__':
     # Note: mae_vit_3d_small() uses fixed architecture (embed_dim=384, depth=8, etc.)
     # The following parameters are kept for compatibility but not used by mae_vit_3d_small()
     parser.add_argument('--embed_dim', type=int, default=768, help='Embedding dimension for ViT encoder')
-    parser.add_argument('--encoder_depth', type=int, default=12, help='Depth of ViT encoder')
-    parser.add_argument('--encoder_heads', type=int, default=12, help='Number of heads in ViT encoder')
-    parser.add_argument('--encoder_mlp_dim', type=int, default=3072, help='MLP dimension in ViT encoder')
-    parser.add_argument('--encoder_dim_head', type=int, default=64, help='Dimension per head in ViT encoder')
-    
+
     parser.add_argument('--decoder_dim', type=int, default=512, help='Dimension of MAE decoder')
     parser.add_argument('--decoder_depth', type=int, default=8, help='Depth of MAE decoder')
-    parser.add_argument('--decoder_heads', type=int, default=16, help='Number of heads in MAE decoder')
-    parser.add_argument('--decoder_dim_head', type=int, default=64, help='Dimension per head in MAE decoder')
 
     # Training parameters
     parser.add_argument('--epochs', type=int, default=2500, help='Number of training epochs')
@@ -598,6 +645,10 @@ if __name__ == '__main__':
     parser.add_argument('--grad_clip_norm', type=float, default=1.0, help='Gradient clipping norm (0 to disable)')
     parser.add_argument('--ema_decay', type=float, default=0.9999, help='EMA decay rate for model averaging')
     parser.add_argument('--norm_pix_loss', action='store_true', help='Use per-patch normalized pixels as loss target.')
+
+    # Initial and final masking ratio
+    parser.add_argument('--initial_masking_ratio', type=float, default=0.40, help='Initial masking ratio')
+    parser.add_argument('--final_masking_ratio', type=float, default=0.40, help='Final masking ratio')
 
     # Logging and Saving
     parser.add_argument('--run_name', type=str, default='mae_membrane_run_v4_ema', help='Name of the W&B run')

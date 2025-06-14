@@ -1,6 +1,7 @@
 import torch
 from torch.utils.data import Dataset
 import numpy as np
+from scipy.ndimage import gaussian_filter
 
 class MembraneSyntheticDataset(Dataset):
     def __init__(self, 
@@ -14,9 +15,13 @@ class MembraneSyntheticDataset(Dataset):
                  seed=42,
                  # --- New parameters for additional spheres ---
                  num_additional_spheres_range=(0, 0),
-                 additional_sphere_radius_range=(0, 0)):
+                 additional_sphere_radius_range=(0, 0),
+                 # --- New parameters for improved realism ---
+                 blur_sigma=0.5,
+                 isovalue_variation=0.1,
+                 intensity_gradient_strength=0.3):
         """
-        Generates 3D synthetic membrane-like structures on-the-fly.
+        Generates 3D synthetic membrane-like structures on-the-fly with improved realism.
 
         Args:
             volume_size (tuple): Size of the 3D volume (depth, height, width).
@@ -29,6 +34,9 @@ class MembraneSyntheticDataset(Dataset):
             seed (int): Base random seed for reproducibility.
             num_additional_spheres_range (tuple): (min, max) number of small solid spheres to add.
             additional_sphere_radius_range (tuple): (min, max) radius for the small solid spheres.
+            blur_sigma (float): Gaussian blur sigma for softer edges.
+            isovalue_variation (float): Range for varying isovalue per sample.
+            intensity_gradient_strength (float): Strength of intensity gradients within membranes.
         """
         self.volume_size = volume_size
         self.num_gaussians_range = num_gaussians_range
@@ -41,6 +49,10 @@ class MembraneSyntheticDataset(Dataset):
         self.epoch = 0  # Track current epoch for seed variation
         self.num_additional_spheres_range = num_additional_spheres_range
         self.additional_sphere_radius_range = additional_sphere_radius_range
+        # New parameters for improved realism
+        self.blur_sigma = blur_sigma
+        self.isovalue_variation = isovalue_variation
+        self.intensity_gradient_strength = intensity_gradient_strength
 
     def _generate_single_sample(self, index, rng_instance):
         """Generates a single 3D volume with a membrane-like structure."""
@@ -70,16 +82,29 @@ class MembraneSyntheticDataset(Dataset):
             ))
             scalar_field += gaussian
 
-        # Normalize scalar field (e.g., to [0, 1] or mean 0, std 1)
+        # Normalize scalar field to [0, 1] range - single normalization step
         if np.max(scalar_field) > np.min(scalar_field):
             scalar_field = (scalar_field - np.min(scalar_field)) / (np.max(scalar_field) - np.min(scalar_field))
         else:
             scalar_field.fill(0) # Avoid division by zero if field is flat
 
-        # Define membrane as an isoband
-        lower_bound = self.isovalue - self.isoband_width / 2
-        upper_bound = self.isovalue + self.isoband_width / 2
+        # Vary isovalue per sample for more diversity
+        sample_isovalue = self.isovalue + current_rng.uniform(-self.isovalue_variation, self.isovalue_variation)
+        sample_isovalue = np.clip(sample_isovalue, 0.1, 0.9)  # Keep within reasonable bounds
+
+        # Define membrane as an isoband with varied isovalue
+        lower_bound = sample_isovalue - self.isoband_width / 2
+        upper_bound = sample_isovalue + self.isoband_width / 2
         membrane = np.logical_and(scalar_field >= lower_bound, scalar_field <= upper_bound).astype(np.float32)
+
+        # Add intensity gradients within the membrane for more realism
+        if self.intensity_gradient_strength > 0:
+            # Create a gradient based on distance from membrane center
+            membrane_distance = np.abs(scalar_field - sample_isovalue) / (self.isoband_width / 2)
+            membrane_distance = np.clip(membrane_distance, 0, 1)
+            # Apply gradient: stronger intensity at membrane center
+            intensity_variation = 1.0 - self.intensity_gradient_strength * membrane_distance
+            membrane = membrane * intensity_variation
 
         # --- Add additional small spheres ---
         if self.num_additional_spheres_range[1] > 0 and self.additional_sphere_radius_range[1] > 0:
@@ -91,15 +116,27 @@ class MembraneSyntheticDataset(Dataset):
                 center_w = current_rng.uniform(0, W)
                 radius = current_rng.uniform(self.additional_sphere_radius_range[0], self.additional_sphere_radius_range[1])
                 
-                # Create a solid sphere
+                # Create a solid sphere with varied intensity
                 sphere_mask = ((d_coords - center_d)**2 + (h_coords - center_h)**2 + (w_coords - center_w)**2) < radius**2
-                membrane[sphere_mask] = 1.0 # Add sphere to the volume
+                sphere_intensity = current_rng.uniform(0.7, 1.0)  # Vary sphere intensity
+                membrane[sphere_mask] = np.maximum(membrane[sphere_mask], sphere_intensity)
 
-        # Add noise
+        # Apply Gaussian blur for softer, more realistic edges
+        if self.blur_sigma > 0:
+            membrane = gaussian_filter(membrane, sigma=self.blur_sigma)
+
+        # Add noise after blurring
         if self.noise_level > 0:
             noise = current_rng.normal(0, self.noise_level, size=self.volume_size).astype(np.float32)
             membrane += noise
-            membrane = np.clip(membrane, 0, 1) # Keep values in a reasonable range after noise
+
+        # Add background baseline for more realistic intensity distribution
+        # Real EM data rarely has pure black backgrounds
+        background_baseline = 0.15
+        membrane += background_baseline
+
+        # Final normalization and clipping - single step
+        membrane = np.clip(membrane, 0.0, 1.0)
         
         # Reshape to (1, D, H, W) for channel dimension
         return torch.from_numpy(membrane).unsqueeze(0)
@@ -135,6 +172,11 @@ def create_membrane_dataloader(batch_size, num_samples, volume_size,
     # Extract sphere arguments from kwargs, with defaults
     num_additional_spheres_range = kwargs.get('num_additional_spheres_range', (0,0))
     additional_sphere_radius_range = kwargs.get('additional_sphere_radius_range', (0,0))
+    
+    # Extract new realism parameters from kwargs, with defaults
+    blur_sigma = kwargs.get('blur_sigma', 0.5)
+    isovalue_variation = kwargs.get('isovalue_variation', 0.1)
+    intensity_gradient_strength = kwargs.get('intensity_gradient_strength', 0.3)
 
     dataset = MembraneSyntheticDataset(
         volume_size=volume_size,
@@ -145,7 +187,10 @@ def create_membrane_dataloader(batch_size, num_samples, volume_size,
         num_samples=num_samples,
         seed=seed,
         num_additional_spheres_range=num_additional_spheres_range,
-        additional_sphere_radius_range=additional_sphere_radius_range
+        additional_sphere_radius_range=additional_sphere_radius_range,
+        blur_sigma=blur_sigma,
+        isovalue_variation=isovalue_variation,
+        intensity_gradient_strength=intensity_gradient_strength
     )
     dataloader = DataLoader(
         dataset,

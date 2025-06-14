@@ -24,7 +24,7 @@ def train_mae_one_epoch(model, dataloader, optimizer, device, epoch):
         volumes = volumes.to(device)
         
         # Forward pass
-        loss, pred, mask = model(volumes)
+        loss, pred, mask, _ = model(volumes)
         
         # Backward pass
         optimizer.zero_grad()
@@ -48,7 +48,7 @@ def visualize_reconstruction(model, dataloader, device, save_path=None):
     with torch.no_grad():
         # Get a batch
         volumes = next(iter(dataloader)).to(device)
-        loss, pred, mask = model(volumes)
+        loss, pred, mask, _ = model(volumes)
         
         # Take first sample
         volume = volumes[0, 0].cpu().numpy()  # Remove batch and channel dims

@@ -45,7 +45,7 @@ def visualize_fixed_sphere_reconstruction(model, sphere_volume, mask_ratio, epoc
         else:
             input_vol = sphere_volume
 
-        loss, pred_patches, mask = model(input_vol, mask_ratio=mask_ratio)
+        loss, pred_patches, mask, _ = model(input_vol, mask_ratio=mask_ratio)
         reconstructed_volume_tensor = model.unpatchify(pred_patches)
         
         original_np = input_vol[0, 0].cpu().numpy()
@@ -137,7 +137,7 @@ def main():
             volumes = batch_volumes.to(device)
             
             optimizer.zero_grad()
-            loss, pred_patches, mask = model(volumes, mask_ratio=config['mask_ratio'])
+            loss, pred_patches, mask, _ = model(volumes, mask_ratio=config['mask_ratio'])
             loss.backward()
             optimizer.step()
 
@@ -151,7 +151,7 @@ def main():
         # Evaluate reconstruction quality on the fixed sphere
         model.eval()
         with torch.no_grad():
-            eval_loss, eval_pred_patches, eval_mask = model(sphere_for_eval_batched, mask_ratio=config['mask_ratio'])
+            eval_loss, eval_pred_patches, eval_mask, _ = model(sphere_for_eval_batched, mask_ratio=config['mask_ratio'])
             reconstructed_eval = model.unpatchify(eval_pred_patches)
             
             original_flat = sphere_for_eval_batched[0,0].cpu().numpy().flatten()

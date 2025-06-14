@@ -368,22 +368,31 @@ class MaskedAutoencoderViT3D(nn.Module):
         return x
 
     def forward_loss(self, imgs, pred, mask):
+        """
+        imgs: [N, C, D, H, W]
+        pred: [N, L, p*p*p*C]
+        mask: [N, L], 0 is keep, 1 is remove
+        """
         target = self.patchify(imgs)
+        
+        patch_stats = None
         if self.norm_pix_loss:
             mean = target.mean(dim=-1, keepdim=True)
             var = target.var(dim=-1, keepdim=True)
             target = (target - mean) / (var.add(1.e-6).sqrt())
+            # Store statistics for denormalization during visualization
+            patch_stats = (mean, var)
 
         loss = (pred - target) ** 2
         loss = loss.mean(dim=-1)
         loss = (loss * mask).sum() / mask.sum()
-        return loss
+        return loss, patch_stats
 
     def forward(self, imgs, mask_ratio=None):
         latent, mask, ids_restore = self.forward_encoder(imgs, mask_ratio if mask_ratio is not None else self.mask_ratio)
         pred = self.forward_decoder(latent, ids_restore)
-        loss = self.forward_loss(imgs, pred, mask)
-        return loss, pred, mask
+        loss, patch_stats = self.forward_loss(imgs, pred, mask)
+        return loss, pred, mask, patch_stats
 
 MaskedAutoencoderViT = MaskedAutoencoderViT3D
 ViT = ViT3D 
