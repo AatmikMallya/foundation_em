@@ -30,6 +30,7 @@ class TrainingProfiler:
         # Data generation tracking
         self.data_gen_times = deque(maxlen=50)
         self.data_transfer_times = deque(maxlen=50)
+        self.data_generation_lock = threading.Lock()
         
         # System info
         self.cpu_count = psutil.cpu_count()
@@ -114,6 +115,11 @@ class TrainingProfiler:
         
         self.data_transfer_times.append(end_time - start_time)
         return data_on_device
+    
+    def add_data_generation_time(self, generation_time):
+        """Add a data generation time measurement from the dataset."""
+        with self.data_generation_lock:
+            self.data_gen_times.append(generation_time)
     
     def start_background_monitoring(self):
         """Start background monitoring of system resources."""

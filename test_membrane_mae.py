@@ -243,6 +243,10 @@ def main(args):
     # Initialize training profiler
     from training_profiler import TrainingProfiler
     profiler = TrainingProfiler(log_interval=5, memory_tracking=True, detailed_timing=True)
+    
+    # Set profiler for data generation tracking
+    from membrane_synthetic_data import set_data_generation_profiler
+    set_data_generation_profiler(profiler)
 
     # Parameters are now controlled via argparse defaults and command-line arguments
     # for better flexibility and experiment tracking.

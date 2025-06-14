@@ -2,6 +2,18 @@ import torch
 from torch.utils.data import Dataset
 import numpy as np
 from scipy.ndimage import gaussian_filter
+import time
+import threading
+
+# Global profiler instance for data generation timing
+_data_generation_profiler = None
+_profiler_lock = threading.Lock()
+
+def set_data_generation_profiler(profiler):
+    """Set the global profiler instance for data generation timing."""
+    global _data_generation_profiler
+    with _profiler_lock:
+        _data_generation_profiler = profiler
 
 class MembraneSyntheticDataset(Dataset):
     def __init__(self, 
@@ -56,31 +68,57 @@ class MembraneSyntheticDataset(Dataset):
 
     def _generate_single_sample(self, index, rng_instance):
         """Generates a single 3D volume with a membrane-like structure."""
+        global _data_generation_profiler
         current_rng = rng_instance
 
         D, H, W = self.volume_size
-        scalar_field = np.zeros((D, H, W), dtype=np.float32)
+        
+        # Profile gaussian field generation
+        if _data_generation_profiler is not None:
+            with _data_generation_profiler.profile_section("gaussian_field_generation"):
+                scalar_field = np.zeros((D, H, W), dtype=np.float32)
+                num_gaussians = current_rng.randint(self.num_gaussians_range[0], self.num_gaussians_range[1] + 1)
 
-        num_gaussians = current_rng.randint(self.num_gaussians_range[0], self.num_gaussians_range[1] + 1)
+                for _ in range(num_gaussians):
+                    center_d = current_rng.uniform(0, D)
+                    center_h = current_rng.uniform(0, H)
+                    center_w = current_rng.uniform(0, W)
+                    sigma_d = current_rng.uniform(self.gaussian_sigma_range[0], self.gaussian_sigma_range[1])
+                    sigma_h = current_rng.uniform(self.gaussian_sigma_range[0], self.gaussian_sigma_range[1])
+                    sigma_w = current_rng.uniform(self.gaussian_sigma_range[0], self.gaussian_sigma_range[1])
+                    amplitude = current_rng.uniform(0.5, 1.5) # Randomize amplitude a bit
 
-        for _ in range(num_gaussians):
-            center_d = current_rng.uniform(0, D)
-            center_h = current_rng.uniform(0, H)
-            center_w = current_rng.uniform(0, W)
-            sigma_d = current_rng.uniform(self.gaussian_sigma_range[0], self.gaussian_sigma_range[1])
-            sigma_h = current_rng.uniform(self.gaussian_sigma_range[0], self.gaussian_sigma_range[1])
-            sigma_w = current_rng.uniform(self.gaussian_sigma_range[0], self.gaussian_sigma_range[1])
-            amplitude = current_rng.uniform(0.5, 1.5) # Randomize amplitude a bit
+                    d_coords, h_coords, w_coords = np.ogrid[:D, :H, :W]
+                    
+                    # Anisotropic Gaussian
+                    gaussian = amplitude * np.exp(-(
+                        ((d_coords - center_d)**2 / (2 * sigma_d**2)) +
+                        ((h_coords - center_h)**2 / (2 * sigma_h**2)) +
+                        ((w_coords - center_w)**2 / (2 * sigma_w**2))
+                    ))
+                    scalar_field += gaussian
+        else:
+            scalar_field = np.zeros((D, H, W), dtype=np.float32)
+            num_gaussians = current_rng.randint(self.num_gaussians_range[0], self.num_gaussians_range[1] + 1)
 
-            d_coords, h_coords, w_coords = np.ogrid[:D, :H, :W]
-            
-            # Anisotropic Gaussian
-            gaussian = amplitude * np.exp(-(
-                ((d_coords - center_d)**2 / (2 * sigma_d**2)) +
-                ((h_coords - center_h)**2 / (2 * sigma_h**2)) +
-                ((w_coords - center_w)**2 / (2 * sigma_w**2))
-            ))
-            scalar_field += gaussian
+            for _ in range(num_gaussians):
+                center_d = current_rng.uniform(0, D)
+                center_h = current_rng.uniform(0, H)
+                center_w = current_rng.uniform(0, W)
+                sigma_d = current_rng.uniform(self.gaussian_sigma_range[0], self.gaussian_sigma_range[1])
+                sigma_h = current_rng.uniform(self.gaussian_sigma_range[0], self.gaussian_sigma_range[1])
+                sigma_w = current_rng.uniform(self.gaussian_sigma_range[0], self.gaussian_sigma_range[1])
+                amplitude = current_rng.uniform(0.5, 1.5) # Randomize amplitude a bit
+
+                d_coords, h_coords, w_coords = np.ogrid[:D, :H, :W]
+                
+                # Anisotropic Gaussian
+                gaussian = amplitude * np.exp(-(
+                    ((d_coords - center_d)**2 / (2 * sigma_d**2)) +
+                    ((h_coords - center_h)**2 / (2 * sigma_h**2)) +
+                    ((w_coords - center_w)**2 / (2 * sigma_w**2))
+                ))
+                scalar_field += gaussian
 
         # Normalize scalar field to [0, 1] range - single normalization step
         if np.max(scalar_field) > np.min(scalar_field):
@@ -123,7 +161,11 @@ class MembraneSyntheticDataset(Dataset):
 
         # Apply Gaussian blur for softer, more realistic edges
         if self.blur_sigma > 0:
-            membrane = gaussian_filter(membrane, sigma=self.blur_sigma)
+            if _data_generation_profiler is not None:
+                with _data_generation_profiler.profile_section("gaussian_blur"):
+                    membrane = gaussian_filter(membrane, sigma=self.blur_sigma)
+            else:
+                membrane = gaussian_filter(membrane, sigma=self.blur_sigma)
 
         # Add noise after blurring
         if self.noise_level > 0:
@@ -145,10 +187,28 @@ class MembraneSyntheticDataset(Dataset):
         return self.num_samples
 
     def __getitem__(self, idx):
+        global _data_generation_profiler
+        
+        # Start timing for data generation
+        start_time = time.time()
+        
         # Generate seed based on epoch and index to ensure different data each epoch
         seed = self.seed + self.epoch * self.num_samples + idx
         rng = np.random.RandomState(seed)
-        return self._generate_single_sample(idx, rng_instance=rng)
+        
+        # Profile the actual data generation
+        if _data_generation_profiler is not None:
+            with _data_generation_profiler.profile_section("cpu_data_generation"):
+                result = self._generate_single_sample(idx, rng_instance=rng)
+        else:
+            result = self._generate_single_sample(idx, rng_instance=rng)
+        
+        # Track total data generation time
+        generation_time = time.time() - start_time
+        if _data_generation_profiler is not None:
+            _data_generation_profiler.add_data_generation_time(generation_time)
+        
+        return result
 
     def set_epoch(self, epoch):
         """ 

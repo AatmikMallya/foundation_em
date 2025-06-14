@@ -208,8 +208,8 @@ def enhanced_visualize_reconstructions(model, dataloader, device, epoch, mask_ra
                 mse_truth_masked = np.mean((original_np - truth_masked_np_i)**2)
                 
                 # Create enhanced visualization
-                fig = plt.figure(figsize=(24, 13)) # Adjusted figure size
-                gs = fig.add_gridspec(3, 4, hspace=0.3, wspace=0.1) # Adjusted grid
+                fig = plt.figure(figsize=(24, 18)) # Increased figure size for 4 rows
+                gs = fig.add_gridspec(4, 5, hspace=0.3, wspace=0.1) # 4 rows, 5 columns for stats
                 
                 D, H, W = original_np.shape
                 mid_z, mid_y, mid_x = D//2, H//2, W//2
@@ -253,10 +253,10 @@ def enhanced_visualize_reconstructions(model, dataloader, device, epoch, mask_ra
                 )
                 
                 # Row 4: Truth-masked comparison
-                axes_truth = []
-                for j in range(3):
-                    ax = fig.add_subplot(gs[3, j])
-                    axes_truth.append(ax)
+                ax_truth_z = fig.add_subplot(gs[3, 0])
+                ax_truth_y = fig.add_subplot(gs[3, 1])
+                ax_truth_x = fig.add_subplot(gs[3, 2])
+                axes_truth = [ax_truth_z, ax_truth_y, ax_truth_x]
                 
                 # Normalize truth-masked data to prevent clipping
                 def safe_normalize_slice(data):
@@ -297,7 +297,7 @@ def enhanced_visualize_reconstructions(model, dataloader, device, epoch, mask_ra
                 ax_patch.axis('off')
                 
                 # Add statistics
-                ax_stats = fig.add_subplot(gs[3, 4:])
+                ax_stats = fig.add_subplot(gs[3, 4])
                 stats_text = f"""
 Reconstruction Statistics:
 • Full Reconstruction MSE: {mse_full:.4f}
