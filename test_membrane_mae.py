@@ -157,7 +157,7 @@ def visualize_reconstructions(model, dataloader, device, epoch, mask_ratio, data
         fig_orig.suptitle(f'Epoch {epoch} - {dataset_name.capitalize()} Example {i+1} - ORIGINAL\nMask {mask_ratio*100:.0f}%', fontsize=16)
         
         current_original_path = Path(save_dir) / f"{dataset_name}_epoch_{epoch}_example_{i+1}_original_slices.png"
-        fig_orig.tight_layout(rect=[0, 0, 1, 0.96])
+        fig_orig.tight_layout()
         fig_orig.savefig(current_original_path, dpi=100, bbox_inches='tight') # Lower dpi for faster save
         plt.close(fig_orig)
         individual_original_image_paths.append(str(current_original_path))
@@ -180,7 +180,7 @@ def visualize_reconstructions(model, dataloader, device, epoch, mask_ratio, data
         fig_recon.suptitle(f'Epoch {epoch} - {dataset_name.capitalize()} Example {i+1} - RECONSTRUCTION\nMask {mask_ratio*100:.0f}% - MSE: {mse:.4f}', fontsize=16)
         
         current_recon_path = Path(save_dir) / f"{dataset_name}_epoch_{epoch}_example_{i+1}_reconstruction_slices.png"
-        fig_recon.tight_layout(rect=[0, 0, 1, 0.96])
+        fig_recon.tight_layout()
         fig_recon.savefig(current_recon_path, dpi=100, bbox_inches='tight') # Lower dpi
         plt.close(fig_recon)
         individual_recon_image_paths.append(str(current_recon_path))
@@ -221,7 +221,7 @@ def visualize_reconstructions(model, dataloader, device, epoch, mask_ratio, data
         axes_summary[1, 2].imshow(first_recon_np[:, mid_y_s, :], cmap='gray', vmin=0, vmax=1); axes_summary[1, 2].set_title('Reconstructed Coronal'); axes_summary[1, 2].axis('off')
         
         fig_summary.suptitle(f'Epoch {epoch} - {dataset_name.capitalize()} Summary (Example 0)\nMask {mask_ratio*100:.0f}% - Avg MSE over {examples_shown} eg: {avg_mse_all_examples:.4f}', fontsize=14)
-        fig_summary.tight_layout(rect=[0, 0, 1, 0.95])
+        fig_summary.tight_layout()
         
         summary_image_path_obj = Path(save_dir) / f"{dataset_name}_epoch_{epoch}_summary_comparison.png"
         fig_summary.savefig(summary_image_path_obj, dpi=100, bbox_inches='tight') # Lower dpi
@@ -234,6 +234,11 @@ def visualize_reconstructions(model, dataloader, device, epoch, mask_ratio, data
 def main(args):
     device = get_device()
     print(f"Using device: {device}")
+    
+    # Enable TensorFloat32 for better performance on Ampere GPUs
+    if torch.cuda.is_available():
+        torch.set_float32_matmul_precision('high')
+        print("Enabled TensorFloat32 for improved performance")
     
     # Initialize training profiler
     from training_profiler import TrainingProfiler
@@ -361,9 +366,9 @@ def main(args):
                 try:
                     # Create a temporary dataloader with the single sample for visualization function
                     temp_vis_loader = [(single_volume.cpu())] # visualize_reconstructions expects an iterable of batches
-                    vis_path = visualize_reconstructions(model, temp_vis_loader, device, iteration + 1, overfit_mask_ratio, "overfit_sample", num_examples=1)
-                    if vis_path:
-                        wandb.log({"overfit_reconstruction": wandb.Image(vis_path), "overfit_iteration": iteration + 1})
+                    original_paths, recon_paths, summary_path = visualize_reconstructions(model, temp_vis_loader, device, iteration + 1, overfit_mask_ratio, "overfit_sample", num_examples=1)
+                    if summary_path:
+                        wandb.log({"overfit_reconstruction": wandb.Image(summary_path), "overfit_iteration": iteration + 1})
                 except Exception as e:
                     print(f"  Overfit visualization failed: {e}")
         print("--- OVERFIT TEST COMPLETE ---")
@@ -421,38 +426,30 @@ def main(args):
             # Get current mask ratio from the new schedule
             current_mask_ratio = get_progressive_mask_ratio(epoch + 1, args.epochs, args.initial_masking_ratio, args.final_masking_ratio) # epoch + 1 for 1-indexed
             
-                    # --- On-the-fly data generation ---
-        # The set_epoch call is crucial to ensure that each epoch gets
-        # a new, unique set of generated samples.
-        with profiler.profile_section("data_epoch_setup"):
-            train_loader.dataset.set_epoch(epoch)
-            # We also set the epoch for the visualization loader to be consistent
-            vis_train_loader.dataset.set_epoch(epoch)
-            # Note: val and vis_val loaders use a fixed seed and don't have their epoch set,
-            # so they will produce the same validation set across runs for consistency.
+            # --- On-the-fly data generation ---
+            with profiler.profile_section("data_epoch_setup"):
+                train_loader.dataset.set_epoch(epoch)
+                vis_train_loader.dataset.set_epoch(epoch)
             
             model.train()
             epoch_loss = 0
-            # For validation: get the first batch of the current epoch
             first_batch_for_logging = None
 
             progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Training] (Mask {current_mask_ratio*100:.0f}%)", unit="batch")
             
             for batch_idx, volumes in enumerate(progress_bar):
-                # Start profiling this batch
                 profiler.start_batch_timing()
-                
-                if batch_idx == 0: # Capture the first batch
-                    first_batch_for_logging = volumes.detach().cpu().clone() # Ensure it's on CPU and a copy
+                if batch_idx == 0:
+                    first_batch_for_logging = volumes.detach().cpu().clone()
 
-                # Profile data transfer to GPU
                 with profiler.profile_section("data_transfer"):
-                    volumes = profiler.profile_data_transfer(volumes, device)
+                    volumes = volumes.to(device)
                     if volumes.ndim == 4: volumes = volumes.unsqueeze(1)
 
                 with profiler.profile_section("optimizer_zero_grad"):
                     optimizer.zero_grad(set_to_none=True)
                 
+                # Forward and backward pass
                 if args.use_amp and scaler:
                     with profiler.profile_section("forward_pass_amp"):
                         with torch.cuda.amp.autocast():
@@ -483,15 +480,12 @@ def main(args):
                     with profiler.profile_section("optimizer_step"):
                         optimizer.step()
                 
-                # Update EMA model after each batch
                 with profiler.profile_section("ema_update"):
                     if ema_model is not None:
                         ema_model.update(model)
             
                 epoch_loss += loss.item()
                 progress_bar.set_postfix(loss=loss.item(), lr=optimizer.param_groups[0]['lr'], mask=f"{current_mask_ratio:.2f}")
-                
-                # End batch profiling
                 profiler.end_batch_timing(batch_idx)
 
             avg_train_loss = epoch_loss / len(train_loader) if len(train_loader) > 0 else 0
@@ -500,17 +494,14 @@ def main(args):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-            # --- Log data characteristic --- 
             log_data_characteristic = {}
             if first_batch_for_logging is not None and first_batch_for_logging.nelement() > 0:
-                # Calculate a simple characteristic, e.g., sum of the first sample in the first batch
                 sample_sum = first_batch_for_logging[0].sum().item()
                 log_data_characteristic = {"epoch_first_train_batch_sample_sum": sample_sum}
-                if epoch < 5 or (epoch + 1) % 100 == 0 : # Print for early epochs and then occasionally
+                if epoch < 5 or (epoch + 1) % 100 == 0 :
                     print(f"Epoch {epoch+1} - First train batch, first sample sum: {sample_sum:.4f}")
-            # --- End log data characteristic ---
 
-            # Validation using EMA model if available
+            # Validation
             with profiler.profile_section("validation_epoch"):
                 eval_model = ema_model.get_model() if ema_model else model
                 eval_model.eval()
@@ -521,13 +512,11 @@ def main(args):
                         with profiler.profile_section("validation_data_transfer"):
                             volumes_val = volumes_val.to(device)
                             if volumes_val.ndim == 4: volumes_val = volumes_val.unsqueeze(1)
-                    
                         with profiler.profile_section("validation_forward"):
                             with torch.cuda.amp.autocast(enabled=args.use_amp):
                                 loss_val, _, _, _ = eval_model(volumes_val, mask_ratio=current_mask_ratio)
-
                         if torch.isnan(loss_val):
-                            print(f"NaN validation loss detected at epoch {epoch+1} for a batch. Skipping batch.")
+                            print(f"NaN validation loss detected at epoch {epoch+1}. Skipping batch.")
                             continue
                         val_loss += loss_val.item()
                         progress_bar_val.set_postfix(loss=loss_val.item())
@@ -535,64 +524,54 @@ def main(args):
             avg_val_loss = val_loss / len(val_loader) if len(val_loader) > 0 else 0
             print(f"Epoch {epoch+1}/{args.epochs} (Mask {current_mask_ratio*100:.0f}%) - Validation Loss (EMA): {avg_val_loss:.4f}")
 
+            # CRITICAL FIX: Reset model to train mode if we modified it during validation
+            if ema_model is None:
+                model.train()  # Reset to train mode if we used the main model for validation
+
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
             log_dict = {
                 "epoch": epoch + 1, "train_loss": avg_train_loss, "val_loss": avg_val_loss,
                 "mask_ratio": current_mask_ratio, "learning_rate": optimizer.param_groups[0]['lr'],
-                **log_data_characteristic # Add our new log item
+                **log_data_characteristic
             }
+
+            # Visualization
             if epoch == 0 or (epoch + 1) % args.vis_interval == 0 or epoch == args.epochs - 1:
                 print(f"  Generating reconstructions for epoch {epoch + 1}...")
                 try:
                     with profiler.profile_section("visualization_generation"):
-                        # Import enhanced visualization
                         from enhanced_visualization import enhanced_visualize_reconstructions
-                        
-                        # Use EMA model for visualization
                         vis_model = ema_model.get_model() if ema_model else model
                         
-                        # Enhanced visualization with color-coded patches
-                        train_enhanced_paths = enhanced_visualize_reconstructions(
-                            vis_model, vis_train_loader, device, epoch + 1, current_mask_ratio, "train", args.vis_samples
-                        )
+                        train_enhanced_paths = enhanced_visualize_reconstructions(vis_model, vis_train_loader, device, epoch + 1, current_mask_ratio, "train", args.vis_samples)
                         if train_enhanced_paths:
-                            log_dict["train_enhanced_visualizations"] = [
-                                wandb.Image(p, caption=f"Enhanced Train E{epoch+1} S{i} (Green=Visible, Red=Masked)") 
-                                for i, p in enumerate(train_enhanced_paths)
-                            ]
+                            log_dict["train_enhanced_visualizations"] = [wandb.Image(p, caption=f"Enhanced Train E{epoch+1} S{i}") for i, p in enumerate(train_enhanced_paths)]
 
-                        val_enhanced_paths = enhanced_visualize_reconstructions(
-                            vis_model, vis_val_loader, device, epoch + 1, current_mask_ratio, "val", args.vis_samples
-                        )
+                        val_enhanced_paths = enhanced_visualize_reconstructions(vis_model, vis_val_loader, device, epoch + 1, current_mask_ratio, "val", args.vis_samples)
                         if val_enhanced_paths:
-                            log_dict["val_enhanced_visualizations"] = [
-                                wandb.Image(p, caption=f"Enhanced Val E{epoch+1} S{i} (Green=Visible, Red=Masked)") 
-                                for i, p in enumerate(val_enhanced_paths)
-                            ]
-                        
+                            log_dict["val_enhanced_visualizations"] = [wandb.Image(p, caption=f"Enhanced Val E{epoch+1} S{i}") for i, p in enumerate(val_enhanced_paths)]
                 except Exception as e:
                     print(f"  Visualization failed for epoch {epoch + 1}: {e}")
+
             wandb.log(log_dict)
-            
-            # Log epoch profiling summary
             profiler.log_epoch_summary(epoch + 1)
 
-            if scheduler: # Check if scheduler is initialized (not in overfit_test)
+            if scheduler:
                 scheduler.step()
 
-            if (epoch + 1) % args.save_interval == 0 or epoch == args.epochs - 1:
+            # Checkpointing
+            if (epoch + 1) % args.save_interval == 0 or (epoch + 1) == args.epochs:
                 checkpoint_dir = os.path.join(wandb.run.dir, "checkpoints")
                 os.makedirs(checkpoint_dir, exist_ok=True)
                 checkpoint_path = os.path.join(checkpoint_dir, f"mae_membrane_epoch_{epoch+1}.pth")
                 
-                # Save both regular model and EMA model
                 checkpoint_data = {
-                    'epoch': epoch + 1, 
+                    'epoch': epoch + 1,
                     'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(), 
-                    'loss': avg_train_loss, 
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
                     'args': args
                 }
                 if ema_model is not None:
@@ -602,9 +581,9 @@ def main(args):
                 torch.save(checkpoint_data, checkpoint_path)
                 wandb.save(checkpoint_path)
                 print(f"Saved checkpoint (including EMA) to {checkpoint_path}")
-
-    # Cleanup profiler
-    profiler.cleanup()
+        
+        # Cleanup after regular training loop
+        profiler.cleanup()
     
     wandb.finish()
     print("Training complete.")

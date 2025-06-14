@@ -271,7 +271,7 @@ class TrainingProfiler:
         return analysis
     
     def log_epoch_summary(self, epoch):
-        """Log comprehensive epoch summary."""
+        """Log comprehensive epoch summary with detailed timing breakdown."""
         if len(self.batch_times) == 0:
             return
             
@@ -286,6 +286,32 @@ class TrainingProfiler:
             "profiling/epoch_batches_processed": len(epoch_batch_times),
             "profiling/epoch_throughput_batches_per_hour": len(epoch_batch_times) / (total_epoch_time / 3600) if total_epoch_time > 0 else 0,
         }
+        
+        # Detailed timing breakdown with percentages
+        timing_breakdown = {}
+        timing_percentages = {}
+        total_component_time = 0
+        
+        for section, times in self.timings.items():
+            if len(times) > 0:
+                section_total_time = sum(times)
+                section_avg_time = np.mean(times)
+                section_percentage = (section_total_time / total_epoch_time * 100) if total_epoch_time > 0 else 0
+                
+                timing_breakdown[f"profiling/epoch_{section}_total_time"] = section_total_time
+                timing_breakdown[f"profiling/epoch_{section}_avg_time"] = section_avg_time
+                timing_percentages[f"profiling/epoch_{section}_percentage"] = section_percentage
+                total_component_time += section_total_time
+        
+        # Add timing breakdown to summary
+        summary.update(timing_breakdown)
+        summary.update(timing_percentages)
+        
+        # Calculate "other" time (unaccounted time)
+        other_time = total_epoch_time - total_component_time
+        if other_time > 0:
+            summary["profiling/epoch_other_time"] = other_time
+            summary["profiling/epoch_other_percentage"] = (other_time / total_epoch_time * 100) if total_epoch_time > 0 else 0
         
         # Data generation summary
         if len(self.data_gen_times) > 0:
@@ -308,25 +334,44 @@ class TrainingProfiler:
         
         wandb.log(summary, step=epoch)
         
-        # Print summary to console
+        # Print detailed summary to console
         print(f"\n=== Epoch {epoch} Profiling Summary ===")
         print(f"Total time: {total_epoch_time:.2f}s")
         print(f"Avg batch time: {avg_batch_time:.3f}s")
         print(f"Throughput: {len(epoch_batch_times) / (total_epoch_time / 3600):.1f} batches/hour")
         
+        # Print timing breakdown
+        print("\n📊 Time Breakdown:")
+        timing_items = []
+        for section, times in self.timings.items():
+            if len(times) > 0:
+                section_total_time = sum(times)
+                section_percentage = (section_total_time / total_epoch_time * 100) if total_epoch_time > 0 else 0
+                timing_items.append((section, section_percentage, section_total_time))
+        
+        # Sort by percentage (highest first)
+        timing_items.sort(key=lambda x: x[1], reverse=True)
+        
+        for section, percentage, total_time in timing_items:
+            print(f"  {section:25s}: {percentage:5.1f}% ({total_time:6.2f}s)")
+        
+        if other_time > 0:
+            other_percentage = (other_time / total_epoch_time * 100)
+            print(f"  {'other/overhead':25s}: {other_percentage:5.1f}% ({other_time:6.2f}s)")
+        
+        # Data generation warning
         if len(self.data_gen_times) > 0:
             data_gen_pct = (sum(self.data_gen_times) / total_epoch_time * 100)
-            print(f"Data generation: {data_gen_pct:.1f}% of total time")
             if data_gen_pct > 30:
-                print("  ⚠️  Data generation may be a bottleneck!")
+                print(f"\n⚠️  Data generation: {data_gen_pct:.1f}% - may be a bottleneck!")
         
+        # Memory warning
         if len(self.memory_stats["ram_percent"]) > 0:
             max_ram = max(self.memory_stats["ram_percent"])
-            print(f"Peak RAM usage: {max_ram:.1f}%")
             if max_ram > 85:
-                print("  ⚠️  High memory usage detected!")
+                print(f"⚠️  Peak RAM usage: {max_ram:.1f}% - high memory usage!")
         
-        print("=" * 40)
+        print("=" * 50)
     
     def cleanup(self):
         """Clean up profiler resources."""

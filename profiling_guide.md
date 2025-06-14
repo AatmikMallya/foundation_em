@@ -21,6 +21,16 @@ The integrated profiling system provides comprehensive performance monitoring fo
 - `profiling/timing_validation_epoch_avg` - Validation time
 - `profiling/timing_visualization_generation_avg` - Visualization generation time
 
+### 📈 **Epoch-Level Timing Percentages**
+- `profiling/epoch_forward_pass_percentage` - % of epoch time spent on forward pass
+- `profiling/epoch_backward_pass_percentage` - % of epoch time spent on backward pass
+- `profiling/epoch_data_transfer_percentage` - % of epoch time spent on data transfer
+- `profiling/epoch_optimizer_step_percentage` - % of epoch time spent on optimizer steps
+- `profiling/epoch_validation_epoch_percentage` - % of epoch time spent on validation
+- `profiling/epoch_ema_update_percentage` - % of epoch time spent on EMA updates
+- `profiling/epoch_visualization_generation_percentage` - % of epoch time spent on visualization
+- `profiling/epoch_other_percentage` - % of epoch time unaccounted for (overhead)
+
 ### 💾 **Memory Usage**
 - `profiling/ram_usage_percent` - System RAM usage percentage
 - `profiling/ram_available_gb` - Available RAM in GB
@@ -52,9 +62,17 @@ The integrated profiling system provides comprehensive performance monitoring fo
 Total time: 45.23s
 Avg batch time: 0.142s
 Throughput: 2547.3 batches/hour
-Data generation: 12.3% of total time
-Peak RAM usage: 67.2%
-========================================
+
+📊 Time Breakdown:
+  forward_pass             : 45.2% (20.45s)
+  backward_pass            : 28.1% (12.71s)
+  data_transfer            :  8.3% ( 3.75s)
+  optimizer_step           :  7.8% ( 3.53s)
+  validation_epoch         :  6.2% ( 2.80s)
+  ema_update              :  2.1% ( 0.95s)
+  visualization_generation :  1.8% ( 0.81s)
+  other/overhead          :  0.5% ( 0.23s)
+==================================================
 ```
 
 ### Bottleneck Warnings

@@ -56,24 +56,33 @@ def create_truth_masked_reconstruction(model, volumes, pred, mask):
     
     return combined_volume
 
-def create_colored_slice_visualization(original_slice, recon_slice, mask_overlay_slice, 
-                                     title_prefix="", vmin=0, vmax=1):
-    """Create a color-coded visualization showing visible vs masked regions."""
-    fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+def draw_slice_comparison(original_slice, recon_slice, mask_overlay_slice, axes, title_prefix=""):
+    """Draws original, recon, color-coded, and diff plots on a given set of axes."""
+    # Normalize slices to [0, 1] range to prevent clipping warnings
+    def safe_normalize(data):
+        data_min, data_max = data.min(), data.max()
+        if data_max > data_min:
+            normalized = (data - data_min) / (data_max - data_min)
+        else:
+            normalized = np.zeros_like(data)
+        return np.clip(normalized, 0.0, 1.0)
+    
+    original_norm = safe_normalize(original_slice)
+    recon_norm = safe_normalize(recon_slice)
     
     # Original
-    axes[0].imshow(original_slice, cmap='gray', vmin=vmin, vmax=vmax)
+    axes[0].imshow(original_norm, cmap='gray', vmin=0, vmax=1)
     axes[0].set_title(f'{title_prefix} Original')
     axes[0].axis('off')
     
     # Reconstruction
-    axes[1].imshow(recon_slice, cmap='gray', vmin=vmin, vmax=vmax)
+    axes[1].imshow(recon_norm, cmap='gray', vmin=0, vmax=1)
     axes[1].set_title(f'{title_prefix} Reconstruction')
     axes[1].axis('off')
     
     # Color-coded overlay (Green=visible, Red=masked)
-    # Create RGB image
-    colored_recon = np.stack([recon_slice] * 3, axis=-1)  # Convert to RGB
+    # Create RGB image using normalized reconstruction
+    colored_recon = np.stack([recon_norm] * 3, axis=-1)  # Convert to RGB
     
     # Apply color coding based on mask
     visible_mask = (mask_overlay_slice == 0)  # Visible patches
@@ -85,18 +94,19 @@ def create_colored_slice_visualization(original_slice, recon_slice, mask_overlay
     # Red tint for masked regions  
     colored_recon[masked_mask, 0] = np.minimum(1.0, colored_recon[masked_mask, 0] + 0.2)  # Add red
     
+    # Ensure RGB values are in [0, 1] range
+    colored_recon = np.clip(colored_recon, 0.0, 1.0)
+    
     axes[2].imshow(colored_recon)
     axes[2].set_title(f'{title_prefix} Color-Coded\n(Green=Visible, Red=Masked)')
     axes[2].axis('off')
     
-    # Difference map
-    diff = np.abs(original_slice - recon_slice)
-    im = axes[3].imshow(diff, cmap='hot', vmin=0, vmax=0.5)
+    # Difference map using normalized data
+    diff = np.abs(original_norm - recon_norm)
+    im = axes[3].imshow(diff, cmap='hot', vmin=0, vmax=1)
     axes[3].set_title(f'{title_prefix} |Difference|')
     axes[3].axis('off')
     plt.colorbar(im, ax=axes[3], fraction=0.046, pad=0.04)
-    
-    return fig
 
 def create_combined_3d_pointcloud(original_volume, recon_volume, mask_overlay, 
                                 threshold=0.5, max_points=5000):
@@ -198,28 +208,48 @@ def enhanced_visualize_reconstructions(model, dataloader, device, epoch, mask_ra
                 mse_truth_masked = np.mean((original_np - truth_masked_np_i)**2)
                 
                 # Create enhanced visualization
-                fig = plt.figure(figsize=(24, 18))
-                gs = fig.add_gridspec(4, 6, hspace=0.3, wspace=0.3)
+                fig = plt.figure(figsize=(24, 13)) # Adjusted figure size
+                gs = fig.add_gridspec(3, 4, hspace=0.3, wspace=0.1) # Adjusted grid
                 
                 D, H, W = original_np.shape
                 mid_z, mid_y, mid_x = D//2, H//2, W//2
                 
-                # Row 1: Axial slices with color coding
-                slice_fig = create_colored_slice_visualization(
+                # --- Create all axes first ---
+                ax_orig_z = fig.add_subplot(gs[0, 0])
+                ax_recon_z = fig.add_subplot(gs[0, 1])
+                ax_color_z = fig.add_subplot(gs[0, 2])
+                ax_diff_z = fig.add_subplot(gs[0, 3])
+
+                ax_orig_y = fig.add_subplot(gs[1, 0])
+                ax_recon_y = fig.add_subplot(gs[1, 1])
+                ax_color_y = fig.add_subplot(gs[1, 2])
+                ax_diff_y = fig.add_subplot(gs[1, 3])
+
+                ax_orig_x = fig.add_subplot(gs[2, 0])
+                ax_recon_x = fig.add_subplot(gs[2, 1])
+                ax_color_x = fig.add_subplot(gs[2, 2])
+                ax_diff_x = fig.add_subplot(gs[2, 3])
+
+                # --- Draw on the axes ---
+                # Axial (Z)
+                draw_slice_comparison(
                     original_np[mid_z], reconstructed_np[mid_z], mask_overlay[mid_z],
+                    [ax_orig_z, ax_recon_z, ax_color_z, ax_diff_z],
                     f"Axial (Z={mid_z})"
                 )
                 
-                # Row 2: Sagittal slices  
-                slice_fig2 = create_colored_slice_visualization(
-                    original_np[:, :, mid_x], reconstructed_np[:, :, mid_x], mask_overlay[:, :, mid_x],
-                    f"Sagittal (X={mid_x})"
-                )
-                
-                # Row 3: Coronal slices
-                slice_fig3 = create_colored_slice_visualization(
+                # Coronal (Y)
+                draw_slice_comparison(
                     original_np[:, mid_y, :], reconstructed_np[:, mid_y, :], mask_overlay[:, mid_y, :],
+                    [ax_orig_y, ax_recon_y, ax_color_y, ax_diff_y],
                     f"Coronal (Y={mid_y})"
+                )
+
+                # Sagittal (X)
+                draw_slice_comparison(
+                    original_np[:, :, mid_x], reconstructed_np[:, :, mid_x], mask_overlay[:, :, mid_x],
+                    [ax_orig_x, ax_recon_x, ax_color_x, ax_diff_x],
+                    f"Sagittal (X={mid_x})"
                 )
                 
                 # Row 4: Truth-masked comparison
@@ -228,15 +258,28 @@ def enhanced_visualize_reconstructions(model, dataloader, device, epoch, mask_ra
                     ax = fig.add_subplot(gs[3, j])
                     axes_truth.append(ax)
                 
-                axes_truth[0].imshow(truth_masked_np_i[mid_z], cmap='gray', vmin=0, vmax=1)
+                # Normalize truth-masked data to prevent clipping
+                def safe_normalize_slice(data):
+                    data_min, data_max = data.min(), data.max()
+                    if data_max > data_min:
+                        normalized = (data - data_min) / (data_max - data_min)
+                    else:
+                        normalized = np.zeros_like(data)
+                    return np.clip(normalized, 0.0, 1.0)
+                
+                truth_axial = safe_normalize_slice(truth_masked_np_i[mid_z])
+                truth_sagittal = safe_normalize_slice(truth_masked_np_i[:, :, mid_x])
+                truth_coronal = safe_normalize_slice(truth_masked_np_i[:, mid_y, :])
+                
+                axes_truth[0].imshow(truth_axial, cmap='gray', vmin=0, vmax=1)
                 axes_truth[0].set_title(f'Truth-Masked Axial\nMSE: {mse_truth_masked:.4f}')
                 axes_truth[0].axis('off')
                 
-                axes_truth[1].imshow(truth_masked_np_i[:, :, mid_x], cmap='gray', vmin=0, vmax=1)
+                axes_truth[1].imshow(truth_sagittal, cmap='gray', vmin=0, vmax=1)
                 axes_truth[1].set_title(f'Truth-Masked Sagittal')
                 axes_truth[1].axis('off')
                 
-                axes_truth[2].imshow(truth_masked_np_i[:, mid_y, :], cmap='gray', vmin=0, vmax=1)
+                axes_truth[2].imshow(truth_coronal, cmap='gray', vmin=0, vmax=1)
                 axes_truth[2].set_title(f'Truth-Masked Coronal')
                 axes_truth[2].axis('off')
                 
@@ -244,8 +287,12 @@ def enhanced_visualize_reconstructions(model, dataloader, device, epoch, mask_ra
                 ax_patch = fig.add_subplot(gs[3, 3])
                 patch_vis = np.zeros_like(original_np[mid_z])
                 patch_vis[mask_overlay[mid_z] == 1] = 1  # Show masked patches
-                ax_patch.imshow(patch_vis, cmap='Reds', alpha=0.7)
-                ax_patch.imshow(original_np[mid_z], cmap='gray', alpha=0.5)
+                
+                # Normalize original slice for overlay
+                original_norm_patch = safe_normalize_slice(original_np[mid_z])
+                
+                ax_patch.imshow(patch_vis, cmap='Reds', alpha=0.7, vmin=0, vmax=1)
+                ax_patch.imshow(original_norm_patch, cmap='gray', alpha=0.5, vmin=0, vmax=1)
                 ax_patch.set_title('Masked Patches\n(Red = Masked)')
                 ax_patch.axis('off')
                 
@@ -276,11 +323,6 @@ Intensity Statistics:
                 fig.tight_layout(rect=[0, 0, 1, 0.96])
                 fig.savefig(enhanced_path, dpi=150, bbox_inches='tight')
                 plt.close(fig)
-                
-                # Close the slice figures
-                plt.close(slice_fig)
-                plt.close(slice_fig2) 
-                plt.close(slice_fig3)
                 
                 individual_paths.append(str(enhanced_path))
                 
