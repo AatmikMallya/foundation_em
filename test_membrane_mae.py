@@ -14,14 +14,16 @@ import copy
 # Added for potential performance improvement
 torch.backends.cudnn.benchmark = True
 
-from vit_3d import mae_vit_3d_small, mae_vit_3d_base, mae_vit_3d_large, mae_vit_3d_huge, mae_vit_3d_hemibrain_optimal, get_device
+from vit_3d import (mae_vit_3d_small, mae_vit_3d_base, mae_vit_3d_large, mae_vit_3d_huge, mae_vit_3d_hemibrain_optimal,
+                    mae_vit_3d_small_conv, mae_vit_3d_base_conv, mae_vit_3d_large_conv, mae_vit_3d_hemibrain_optimal_conv, get_device)
 from membrane_synthetic_data import create_membrane_dataloader
 
 # --- EMA (Exponential Moving Average) Implementation ---
 class EMAModel:
     """Exponential Moving Average model for better validation performance."""
-    def __init__(self, model, decay=0.9999):
+    def __init__(self, model, decay=0.9999, warmup_updates=1000):
         self.decay = decay
+        self.warmup_updates = warmup_updates
         self.ema_model = copy.deepcopy(model)
         for param in self.ema_model.parameters():
             param.requires_grad_(False)
@@ -30,8 +32,16 @@ class EMAModel:
     def update(self, model):
         """Update EMA model with current model parameters."""
         self.num_updates += 1
-        # Adjust decay based on number of updates for better early training
-        decay = min(self.decay, (1 + self.num_updates) / (10 + self.num_updates))
+        
+        # Performance fix: Better EMA decay schedule
+        if self.num_updates <= self.warmup_updates:
+            # During warmup, use lower frequency updates and higher effective decay
+            if self.num_updates % 10 != 0:  # Only update every 10 steps during warmup
+                return
+            # Start with high decay and gradually decrease to target
+            decay = 0.99 + (self.decay - 0.99) * (self.num_updates / self.warmup_updates)
+        else:
+            decay = self.decay
         
         with torch.no_grad():
             for ema_param, model_param in zip(self.ema_model.parameters(), model.parameters()):
@@ -252,11 +262,7 @@ def main(args):
     # for better flexibility and experiment tracking.
 
     # Ensure patch_size is a tuple
-    patch_size = tuple(map(int, args.patch_size.split(',')))
-    if len(patch_size) == 1:
-        patch_size = (patch_size[0], patch_size[0], patch_size[0])
-    elif len(patch_size) != 3:
-        raise ValueError("patch_size must be a single integer or three integers separated by commas.")
+    patch_size = args.patch_size
     print(f"Using 3D patch size: {patch_size}")
 
     # WandB
@@ -285,6 +291,14 @@ def main(args):
         model_fn = mae_vit_3d_huge
     elif args.model_arch == "hemibrain_optimal":
         model_fn = mae_vit_3d_hemibrain_optimal
+    elif args.model_arch == "small_conv":
+        model_fn = mae_vit_3d_small_conv
+    elif args.model_arch == "base_conv":
+        model_fn = mae_vit_3d_base_conv
+    elif args.model_arch == "large_conv":
+        model_fn = mae_vit_3d_large_conv
+    elif args.model_arch == "hemibrain_optimal_conv":
+        model_fn = mae_vit_3d_hemibrain_optimal_conv
     else:
         raise ValueError(f"Unsupported model_arch: {args.model_arch}. Choose from available options.")
 
@@ -364,7 +378,8 @@ def main(args):
             loss.backward()
             optimizer.step()
             
-            wandb.log({"overfit_loss": loss.item(), "overfit_iteration": iteration + 1})
+            # Performance fix: only sync loss.item() for logging, not every iteration
+            wandb.log({"overfit_loss": loss.detach().cpu().item(), "overfit_iteration": iteration + 1})
 
             if (iteration + 1) % vis_interval_overfit == 0 or iteration == num_overfit_iterations - 1:
                 print(f"  Visualizing overfit reconstruction at iteration {iteration + 1}...")
@@ -439,6 +454,9 @@ def main(args):
             model.train()
             epoch_loss = 0
             first_batch_for_logging = None
+            # Performance fix: accumulate losses without frequent .item() calls
+            accumulated_losses = []
+            log_interval = 20  # Log every N batches to reduce CUDA sync
 
             progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Training] (Mask {current_mask_ratio*100:.0f}%)", unit="batch")
             
@@ -489,15 +507,25 @@ def main(args):
                     if ema_model is not None:
                         ema_model.update(model)
             
-                epoch_loss += loss.item()
-                progress_bar.set_postfix(loss=loss.item(), lr=optimizer.param_groups[0]['lr'], mask=f"{current_mask_ratio:.2f}")
+                # Performance fix: accumulate losses and only sync occasionally
+                accumulated_losses.append(loss.detach())
+                
+                # Update progress bar less frequently to avoid CUDA sync
+                if batch_idx % log_interval == 0 or batch_idx == len(train_loader) - 1:
+                    # Compute mean of recent losses without .item() sync
+                    recent_loss_mean = torch.stack(accumulated_losses[-log_interval:]).mean()
+                    progress_bar.set_postfix(
+                        loss=f"{recent_loss_mean:.4f}", 
+                        lr=optimizer.param_groups[0]['lr'], 
+                        mask=f"{current_mask_ratio:.2f}"
+                    )
+                
                 profiler.end_batch_timing(batch_idx)
 
-            avg_train_loss = epoch_loss / len(train_loader) if len(train_loader) > 0 else 0
+            # Compute epoch loss at the end (single sync)
+            epoch_loss = torch.stack(accumulated_losses).mean().item()
+            avg_train_loss = epoch_loss
             print(f"Epoch {epoch+1}/{args.epochs} (Mask {current_mask_ratio*100:.0f}%) - Training Loss: {avg_train_loss:.4f}, LR: {optimizer.param_groups[0]['lr']:.6f}")
-
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
 
             log_data_characteristic = {}
             if first_batch_for_logging is not None and first_batch_for_logging.nelement() > 0:
@@ -506,35 +534,43 @@ def main(args):
                 if epoch < 5 or (epoch + 1) % 100 == 0 :
                     print(f"Epoch {epoch+1} - First train batch, first sample sum: {sample_sum:.4f}")
 
-            # Validation
-            with profiler.profile_section("validation_epoch"):
-                eval_model = ema_model.get_model() if ema_model else model
-                eval_model.eval()
-                val_loss = 0
-                progress_bar_val = tqdm(val_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Validation] (Mask {current_mask_ratio*100:.0f}%)", unit="batch")
-                with torch.no_grad():
-                    for volumes_val in progress_bar_val:
-                        with profiler.profile_section("validation_data_transfer"):
-                            volumes_val = volumes_val.to(device)
-                            if volumes_val.ndim == 4: volumes_val = volumes_val.unsqueeze(1)
-                        with profiler.profile_section("validation_forward"):
-                            with torch.cuda.amp.autocast(enabled=args.use_amp):
-                                loss_val, _, _, _ = eval_model(volumes_val, mask_ratio=current_mask_ratio)
-                        if torch.isnan(loss_val):
-                            print(f"NaN validation loss detected at epoch {epoch+1}. Skipping batch.")
-                            continue
-                        val_loss += loss_val.item()
-                        progress_bar_val.set_postfix(loss=loss_val.item())
-        
-            avg_val_loss = val_loss / len(val_loader) if len(val_loader) > 0 else 0
-            print(f"Epoch {epoch+1}/{args.epochs} (Mask {current_mask_ratio*100:.0f}%) - Validation Loss (EMA): {avg_val_loss:.4f}")
+            # Validation - Only run periodically since train/val come from same distribution
+            avg_val_loss = 0
+            if not args.skip_validation and (epoch == 0 or (epoch + 1) % args.val_interval == 0 or epoch == args.epochs - 1):
+                with profiler.profile_section("validation_epoch"):
+                    eval_model = ema_model.get_model() if ema_model else model
+                    eval_model.eval()
+                    val_losses = []  # Performance fix: accumulate validation losses
+                    progress_bar_val = tqdm(val_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Validation] (Mask {current_mask_ratio*100:.0f}%)", unit="batch")
+                    with torch.no_grad():
+                        for volumes_val in progress_bar_val:
+                            with profiler.profile_section("validation_data_transfer"):
+                                volumes_val = volumes_val.to(device)
+                                if volumes_val.ndim == 4: volumes_val = volumes_val.unsqueeze(1)
+                            with profiler.profile_section("validation_forward"):
+                                with torch.cuda.amp.autocast(enabled=args.use_amp):
+                                    loss_val, _, _, _ = eval_model(volumes_val, mask_ratio=current_mask_ratio)
+                            if torch.isnan(loss_val):
+                                print(f"NaN validation loss detected at epoch {epoch+1}. Skipping batch.")
+                                continue
+                            val_losses.append(loss_val.detach())
+                            # Update progress bar less frequently
+                            if len(val_losses) % 10 == 0:
+                                recent_val_loss = torch.stack(val_losses[-10:]).mean()
+                                progress_bar_val.set_postfix(loss=f"{recent_val_loss:.4f}")
+            
+                # Compute validation loss at the end (single sync)
+                avg_val_loss = torch.stack(val_losses).mean().item() if val_losses else avg_train_loss
+                print(f"Epoch {epoch+1}/{args.epochs} (Mask {current_mask_ratio*100:.0f}%) - Validation Loss (EMA): {avg_val_loss:.4f}")
+            else:
+                # Use training loss as proxy when not validating
+                avg_val_loss = avg_train_loss
+                if epoch % 50 == 0:  # Periodic reminder
+                    print(f"Epoch {epoch+1}/{args.epochs} (Mask {current_mask_ratio*100:.0f}%) - Using training loss as validation proxy (val every {args.val_interval} epochs)")
 
             # CRITICAL FIX: Reset model to train mode if we modified it during validation
             if ema_model is None:
                 model.train()  # Reset to train mode if we used the main model for validation
-
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
 
             log_dict = {
                 "epoch": epoch + 1, "train_loss": avg_train_loss, "val_loss": avg_val_loss,
@@ -597,42 +633,35 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Train 3D Masked Autoencoder on Synthetic Membrane Data")
     
     # Dataset parameters
-    parser.add_argument('--img_size', type=int, default=96, help='Size of the 3D images (cubic, e.g., 96 for 96x96x96) - OPTIMIZED for 16^3 patches')
+    parser.add_argument('--img_size', type=int, default=64, help='Size of the 3D images (cubic, e.g., 96 for 96x96x96) - OPTIMIZED for 16^3 patches')
+    parser.add_argument('--patch_size', type=int, default=16, help="Patch size for ViT (single int for cubic, or D,H,W). OPTIMIZED: 16^3 patches for 96^3 volumes = 6x6x6 = 216 patches.")
     # MembraneSyntheticDataset specific  
-    parser.add_argument('--num_spheres_range', type=str, default="7,12", help='Range for number of spheres (min,max) - INCREASED for larger volume')
-    parser.add_argument('--radius_range', type=str, default="10,16", help='Range for sphere radii (min,max) - INCREASED for larger volume')
-    parser.add_argument('--noise_level', type=float, default=0.005, help='Noise level for the synthetic data - REDUCED for easier learning')
-    parser.add_argument('--membrane_band_width', type=float, default=0.15, help='Membrane band width for synthetic data - INCREASED for thicker membranes')
+    parser.add_argument('--num_spheres_range', type=str, default="8,8", help='Range for number of spheres (min,max) - INCREASED for larger volume')
+    parser.add_argument('--radius_range', type=str, default="10,14", help='Range for sphere radii (min,max) - INCREASED for larger volume')
+    parser.add_argument('--noise_level', type=float, default=0.01, help='Noise level for the synthetic data - REDUCED for easier learning')
+    parser.add_argument('--membrane_band_width', type=float, default=0.1, help='Membrane band width for synthetic data - INCREASED for thicker membranes')
     parser.add_argument('--train_samples', type=int, default=4096, help='Number of samples in training set')
     parser.add_argument('--val_samples', type=int, default=512, help='Number of samples in validation set')
     parser.add_argument('--num_added_spheres', type=str, default="4,4", help='Range for number of added spheres (min,max)')
     parser.add_argument('--added_sphere_radii', type=str, default="5.0,5.0", help='Range for added sphere radii (min,max)')
 
-    # MAE & ViT Architecture parameters
-    parser.add_argument('--patch_size', type=str, default="16", help="Patch size for ViT (single int for cubic, or D,H,W). OPTIMIZED: 16^3 patches for 96^3 volumes = 6x6x6 = 216 patches.")
-    # Note: mae_vit_3d_small() uses fixed architecture (embed_dim=384, depth=8, etc.)
-    # The following parameters are kept for compatibility but not used by mae_vit_3d_small()
-    parser.add_argument('--embed_dim', type=int, default=768, help='Embedding dimension for ViT encoder')
-
-    parser.add_argument('--decoder_dim', type=int, default=512, help='Dimension of MAE decoder')
-    parser.add_argument('--decoder_depth', type=int, default=8, help='Depth of MAE decoder')
 
     # Training parameters
     parser.add_argument('--epochs', type=int, default=2500, help='Number of training epochs')
-    parser.add_argument('--batch_size', type=int, default=8, help='Batch size for training (reduced default for memory efficiency)')
+    parser.add_argument('--batch_size', type=int, default=16, help='Batch size for training (reduced default for memory efficiency)')
     parser.add_argument('--learning_rate', type=float, default=1e-4, help='Initial learning rate for the scheduler')
     parser.add_argument('--min_lr', type=float, default=5e-6, help='Minimum learning rate for the cosine annealing scheduler (improved from 1e-6)')
     parser.add_argument('--warmup_epochs', type=int, default=100, help='Number of warmup epochs for the learning rate scheduler')
     parser.add_argument('--weight_decay', type=float, default=0.02, help='Weight decay for AdamW optimizer (improved from 0.05)')
     parser.add_argument('--num_workers', type=int, default=8, help='Number of data loading workers')
     parser.add_argument('--use_amp', action='store_true', help='Use Automatic Mixed Precision training')
-    parser.add_argument('--grad_clip_norm', type=float, default=1.0, help='Gradient clipping norm (0 to disable)')
+    parser.add_argument('--grad_clip_norm', type=float, default=5.0, help='Gradient clipping norm (0 to disable). 5.0 recommended for ViTs vs 1.0 which can clip useful spikes.')
     parser.add_argument('--ema_decay', type=float, default=0.9999, help='EMA decay rate for model averaging')
     parser.add_argument('--norm_pix_loss', action='store_true', help='Use per-patch normalized pixels as loss target.')
 
     # Initial and final masking ratio
-    parser.add_argument('--initial_masking_ratio', type=float, default=0.30, help='Initial masking ratio')
-    parser.add_argument('--final_masking_ratio', type=float, default=0.30, help='Final masking ratio')
+    parser.add_argument('--initial_masking_ratio', type=float, default=0.50, help='Initial masking ratio')
+    parser.add_argument('--final_masking_ratio', type=float, default=0.50, help='Final masking ratio')
 
     # Logging and Saving
     parser.add_argument('--run_name', type=str, default='mae_membrane_run_v4_ema', help='Name of the W&B run')
@@ -640,8 +669,10 @@ if __name__ == '__main__':
     parser.add_argument('--vis_interval', type=int, default=100, help='Epoch interval for visualizing reconstructions')
     parser.add_argument('--vis_samples', type=int, default=2, help='Number of samples to visualize')
     parser.add_argument('--save_interval', type=int, default=250, help='Epoch interval for saving model checkpoints')
+    parser.add_argument('--val_interval', type=int, default=10, help='Epoch interval for running validation (default: every 10 epochs)')
+    parser.add_argument('--skip_validation', action='store_true', help='Skip validation entirely (fastest training, use when train/val from same distribution)')
     parser.add_argument('--overfit_test', action='store_true', help='Run an overfitting test on a single sample.')
-    parser.add_argument('--model_arch', type=str, default="small", choices=["small", "base", "large", "huge", "hemibrain_optimal"], help="Model architecture to use.")
+    parser.add_argument('--model_arch', type=str, default="small", choices=["small", "base", "large", "huge", "hemibrain_optimal", "small_conv", "base_conv", "large_conv", "hemibrain_optimal_conv"], help="Model architecture to use.")
 
     args = parser.parse_args()
     

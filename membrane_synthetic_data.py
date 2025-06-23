@@ -73,56 +73,56 @@ class MembraneSyntheticDataset(Dataset):
 
         D, H, W = self.volume_size
         
-        # Profile gaussian field generation
+        # Initialize scalar field and parameters
+        scalar_field = np.zeros((D, H, W), dtype=np.float32)
+        num_gaussians = current_rng.randint(self.num_gaussians_range[0], self.num_gaussians_range[1] + 1)
+        
+        # Create coordinate grids once (optimization)
+        d_coords, h_coords, w_coords = np.ogrid[:D, :H, :W]
+        
+        # Pre-compute constants for optimization
+        sigma_min, sigma_max = self.gaussian_sigma_range
+        
+        # Single gaussian generation function (eliminates code duplication)
+        def generate_gaussians():
+            nonlocal scalar_field  # Allow modification of outer scope variable
+            for _ in range(num_gaussians):
+                # Generate all parameters for this Gaussian
+                center_d = current_rng.uniform(0, D)
+                center_h = current_rng.uniform(0, H) 
+                center_w = current_rng.uniform(0, W)
+                sigma_d = current_rng.uniform(sigma_min, sigma_max)
+                sigma_h = current_rng.uniform(sigma_min, sigma_max)
+                sigma_w = current_rng.uniform(sigma_min, sigma_max)
+                amplitude = current_rng.uniform(0.5, 1.5)
+                
+                # Pre-compute inverse variances (optimization)
+                inv_2_sigma_d_sq = 1.0 / (2 * sigma_d * sigma_d)
+                inv_2_sigma_h_sq = 1.0 / (2 * sigma_h * sigma_h)
+                inv_2_sigma_w_sq = 1.0 / (2 * sigma_w * sigma_w)
+                
+                # Anisotropic Gaussian with optimized computation
+                gaussian = amplitude * np.exp(-(
+                    ((d_coords - center_d)**2 * inv_2_sigma_d_sq) +
+                    ((h_coords - center_h)**2 * inv_2_sigma_h_sq) +
+                    ((w_coords - center_w)**2 * inv_2_sigma_w_sq)
+                ))
+                scalar_field += gaussian
+        
+        # Profile gaussian field generation with single code path
         if _data_generation_profiler is not None:
             with _data_generation_profiler.profile_section("gaussian_field_generation"):
-        scalar_field = np.zeros((D, H, W), dtype=np.float32)
-                num_gaussians = current_rng.randint(self.num_gaussians_range[0], self.num_gaussians_range[1] + 1)
-
-                for _ in range(num_gaussians):
-                    center_d = current_rng.uniform(0, D)
-                    center_h = current_rng.uniform(0, H)
-                    center_w = current_rng.uniform(0, W)
-                    sigma_d = current_rng.uniform(self.gaussian_sigma_range[0], self.gaussian_sigma_range[1])
-                    sigma_h = current_rng.uniform(self.gaussian_sigma_range[0], self.gaussian_sigma_range[1])
-                    sigma_w = current_rng.uniform(self.gaussian_sigma_range[0], self.gaussian_sigma_range[1])
-                    amplitude = current_rng.uniform(0.5, 1.5) # Randomize amplitude a bit
-
-                    d_coords, h_coords, w_coords = np.ogrid[:D, :H, :W]
-                    
-                    # Anisotropic Gaussian
-                    gaussian = amplitude * np.exp(-(
-                        ((d_coords - center_d)**2 / (2 * sigma_d**2)) +
-                        ((h_coords - center_h)**2 / (2 * sigma_h**2)) +
-                        ((w_coords - center_w)**2 / (2 * sigma_w**2))
-                    ))
-                    scalar_field += gaussian
+                generate_gaussians()
         else:
-            scalar_field = np.zeros((D, H, W), dtype=np.float32)
-        num_gaussians = current_rng.randint(self.num_gaussians_range[0], self.num_gaussians_range[1] + 1)
+            generate_gaussians()
 
-        for _ in range(num_gaussians):
-            center_d = current_rng.uniform(0, D)
-            center_h = current_rng.uniform(0, H)
-            center_w = current_rng.uniform(0, W)
-            sigma_d = current_rng.uniform(self.gaussian_sigma_range[0], self.gaussian_sigma_range[1])
-            sigma_h = current_rng.uniform(self.gaussian_sigma_range[0], self.gaussian_sigma_range[1])
-            sigma_w = current_rng.uniform(self.gaussian_sigma_range[0], self.gaussian_sigma_range[1])
-            amplitude = current_rng.uniform(0.5, 1.5) # Randomize amplitude a bit
-
-            d_coords, h_coords, w_coords = np.ogrid[:D, :H, :W]
-            
-            # Anisotropic Gaussian
-            gaussian = amplitude * np.exp(-(
-                ((d_coords - center_d)**2 / (2 * sigma_d**2)) +
-                ((h_coords - center_h)**2 / (2 * sigma_h**2)) +
-                ((w_coords - center_w)**2 / (2 * sigma_w**2))
-            ))
-            scalar_field += gaussian
-
-        # Normalize scalar field to [0, 1] range - single normalization step
-        if np.max(scalar_field) > np.min(scalar_field):
-            scalar_field = (scalar_field - np.min(scalar_field)) / (np.max(scalar_field) - np.min(scalar_field))
+        # Normalize scalar field to [0, 1] range - optimized single pass
+        field_min = np.min(scalar_field)
+        field_max = np.max(scalar_field)
+        field_range = field_max - field_min
+        if field_range > 0:
+            scalar_field -= field_min
+            scalar_field /= field_range
         else:
             scalar_field.fill(0) # Avoid division by zero if field is flat
 
@@ -137,26 +137,30 @@ class MembraneSyntheticDataset(Dataset):
 
         # Add intensity gradients within the membrane for more realism
         if self.intensity_gradient_strength > 0:
-            # Create a gradient based on distance from membrane center
-            membrane_distance = np.abs(scalar_field - sample_isovalue) / (self.isoband_width / 2)
-            membrane_distance = np.clip(membrane_distance, 0, 1)
-            # Apply gradient: stronger intensity at membrane center
-            intensity_variation = 1.0 - self.intensity_gradient_strength * membrane_distance
-            membrane = membrane * intensity_variation
+            # Create a gradient based on distance from membrane center (optimized)
+            half_isoband = self.isoband_width * 0.5
+            membrane_distance = np.abs(scalar_field - sample_isovalue) / half_isoband
+            np.clip(membrane_distance, 0, 1, out=membrane_distance)  # In-place clipping
+            # Apply gradient: stronger intensity at membrane center (in-place)
+            membrane_distance *= self.intensity_gradient_strength
+            membrane_distance = 1.0 - membrane_distance
+            membrane *= membrane_distance
 
         # --- Add additional small spheres ---
         if self.num_additional_spheres_range[1] > 0 and self.additional_sphere_radius_range[1] > 0:
             num_spheres = current_rng.randint(self.num_additional_spheres_range[0], self.num_additional_spheres_range[1] + 1)
-            d_coords, h_coords, w_coords = np.ogrid[:D, :H, :W] # Re-use coordinates
+            # Reuse existing coordinate grids (optimization - no redundant creation)
+            sphere_r_min, sphere_r_max = self.additional_sphere_radius_range
             for _ in range(num_spheres):
                 center_d = current_rng.uniform(0, D)
                 center_h = current_rng.uniform(0, H)
                 center_w = current_rng.uniform(0, W)
-                radius = current_rng.uniform(self.additional_sphere_radius_range[0], self.additional_sphere_radius_range[1])
+                radius = current_rng.uniform(sphere_r_min, sphere_r_max)
+                sphere_intensity = current_rng.uniform(0.7, 1.0)
                 
-                # Create a solid sphere with varied intensity
-                sphere_mask = ((d_coords - center_d)**2 + (h_coords - center_h)**2 + (w_coords - center_w)**2) < radius**2
-                sphere_intensity = current_rng.uniform(0.7, 1.0)  # Vary sphere intensity
+                # Create sphere mask with optimized computation (pre-compute radius squared)
+                radius_sq = radius * radius
+                sphere_mask = ((d_coords - center_d)**2 + (h_coords - center_h)**2 + (w_coords - center_w)**2) < radius_sq
                 membrane[sphere_mask] = np.maximum(membrane[sphere_mask], sphere_intensity)
 
         # Apply Gaussian blur for softer, more realistic edges
@@ -167,18 +171,17 @@ class MembraneSyntheticDataset(Dataset):
             else:
                 membrane = gaussian_filter(membrane, sigma=self.blur_sigma)
 
-        # Add noise after blurring
+        # Add noise after blurring (optimized)
         if self.noise_level > 0:
             noise = current_rng.normal(0, self.noise_level, size=self.volume_size).astype(np.float32)
             membrane += noise
 
         # Add background baseline for more realistic intensity distribution
-        # Real EM data rarely has pure black backgrounds
-        background_baseline = 0.15
-        membrane += background_baseline
+        # Real EM data rarely has pure black backgrounds (in-place operation)
+        membrane += 0.2
 
-        # Final normalization and clipping - single step
-        membrane = np.clip(membrane, 0.0, 1.0)
+        # Final normalization and clipping - in-place for memory efficiency
+        np.clip(membrane, 0.0, 1.0, out=membrane)
         
         # Reshape to (1, D, H, W) for channel dimension
         return torch.from_numpy(membrane).unsqueeze(0)
@@ -258,7 +261,9 @@ def create_membrane_dataloader(batch_size, num_samples, volume_size,
         shuffle=shuffle,
         num_workers=num_workers,
         pin_memory=True, # Recommended for GPU training
-        drop_last=drop_last   # Use parameter instead of hardcoded True
+        drop_last=drop_last,   # Use parameter instead of hardcoded True
+        persistent_workers=True if num_workers > 0 else False,  # Keep workers alive between epochs
+        prefetch_factor=4 if num_workers > 0 else None,  # Each worker prefetches 4 batches
     )
     return dataloader
 

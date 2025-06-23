@@ -208,8 +208,8 @@ def enhanced_visualize_reconstructions(model, dataloader, device, epoch, mask_ra
                 mse_truth_masked = np.mean((original_np - truth_masked_np_i)**2)
                 
                 # Create enhanced visualization
-                fig = plt.figure(figsize=(24, 18)) # Increased figure size for 4 rows
-                gs = fig.add_gridspec(4, 5, hspace=0.3, wspace=0.1) # 4 rows, 5 columns for stats
+                fig = plt.figure(figsize=(24, 14)) # Reduced figure size for 3 rows
+                gs = fig.add_gridspec(3, 5, hspace=0.3, wspace=0.1) # 3 rows, 5 columns for stats
                 
                 D, H, W = original_np.shape
                 mid_z, mid_y, mid_x = D//2, H//2, W//2
@@ -252,52 +252,8 @@ def enhanced_visualize_reconstructions(model, dataloader, device, epoch, mask_ra
                     f"Sagittal (X={mid_x})"
                 )
                 
-                # Row 4: Truth-masked comparison
-                ax_truth_z = fig.add_subplot(gs[3, 0])
-                ax_truth_y = fig.add_subplot(gs[3, 1])
-                ax_truth_x = fig.add_subplot(gs[3, 2])
-                axes_truth = [ax_truth_z, ax_truth_y, ax_truth_x]
-                
-                # Normalize truth-masked data to prevent clipping
-                def safe_normalize_slice(data):
-                    data_min, data_max = data.min(), data.max()
-                    if data_max > data_min:
-                        normalized = (data - data_min) / (data_max - data_min)
-                    else:
-                        normalized = np.zeros_like(data)
-                    return np.clip(normalized, 0.0, 1.0)
-                
-                truth_axial = safe_normalize_slice(truth_masked_np_i[mid_z])
-                truth_sagittal = safe_normalize_slice(truth_masked_np_i[:, :, mid_x])
-                truth_coronal = safe_normalize_slice(truth_masked_np_i[:, mid_y, :])
-                
-                axes_truth[0].imshow(truth_axial, cmap='gray', vmin=0, vmax=1)
-                axes_truth[0].set_title(f'Truth-Masked Axial\nMSE: {mse_truth_masked:.4f}')
-                axes_truth[0].axis('off')
-                
-                axes_truth[1].imshow(truth_sagittal, cmap='gray', vmin=0, vmax=1)
-                axes_truth[1].set_title(f'Truth-Masked Sagittal')
-                axes_truth[1].axis('off')
-                
-                axes_truth[2].imshow(truth_coronal, cmap='gray', vmin=0, vmax=1)
-                axes_truth[2].set_title(f'Truth-Masked Coronal')
-                axes_truth[2].axis('off')
-                
-                # Add patch grid visualization
-                ax_patch = fig.add_subplot(gs[3, 3])
-                patch_vis = np.zeros_like(original_np[mid_z])
-                patch_vis[mask_overlay[mid_z] == 1] = 1  # Show masked patches
-                
-                # Normalize original slice for overlay
-                original_norm_patch = safe_normalize_slice(original_np[mid_z])
-                
-                ax_patch.imshow(patch_vis, cmap='Reds', alpha=0.7, vmin=0, vmax=1)
-                ax_patch.imshow(original_norm_patch, cmap='gray', alpha=0.5, vmin=0, vmax=1)
-                ax_patch.set_title('Masked Patches\n(Red = Masked)')
-                ax_patch.axis('off')
-                
-                # Add statistics
-                ax_stats = fig.add_subplot(gs[3, 4])
+                # Add statistics in the remaining column
+                ax_stats = fig.add_subplot(gs[:, 4])  # Span all rows in column 4
                 stats_text = f"""
 Reconstruction Statistics:
 • Full Reconstruction MSE: {mse_full:.4f}
@@ -312,7 +268,7 @@ Intensity Statistics:
 • Truth-Masked: min={truth_masked_np_i.min():.3f}, max={truth_masked_np_i.max():.3f}, mean={truth_masked_np_i.mean():.3f}
                 """
                 ax_stats.text(0.05, 0.95, stats_text, transform=ax_stats.transAxes, 
-                            fontsize=10, verticalalignment='top', fontfamily='monospace')
+                            fontsize=12, verticalalignment='top', fontfamily='monospace')
                 ax_stats.axis('off')
                 
                 fig.suptitle(f'Enhanced MAE Visualization - Epoch {epoch} - {dataset_name.capitalize()} Example {examples_shown+1}\n'
@@ -326,39 +282,39 @@ Intensity Statistics:
                 
                 individual_paths.append(str(enhanced_path))
                 
-                # Create enhanced 3D point cloud for first example
-                if examples_shown == 0:
-                    try:
-                        combined_points, combined_colors = create_combined_3d_pointcloud(
-                            original_np, reconstructed_np, mask_overlay
-                        )
-                        
-                        if combined_points is not None:
-                            # Log combined point cloud
-                            wandb.log({
-                                f"{dataset_name}/enhanced_3d_comparison": wandb.Object3D({
-                                    "type": "lidar/beta",
-                                    "points": combined_points,
-                                    "colors": combined_colors
-                                })
-                            }, step=epoch)
-                            
-                            # Also log separate visible and masked point clouds
-                            visible_points = np.argwhere((original_np > 0.5) & (mask_overlay == 0))
-                            masked_points = np.argwhere((original_np > 0.5) & (mask_overlay == 1))
-                            
-                            if len(visible_points) > 0:
-                                wandb.log({
-                                    f"{dataset_name}/visible_patches_3d": wandb.Object3D(visible_points.astype(np.float32))
-                                }, step=epoch)
-                            
-                            if len(masked_points) > 0:
-                                wandb.log({
-                                    f"{dataset_name}/masked_patches_3d": wandb.Object3D(masked_points.astype(np.float32))
-                                }, step=epoch)
-                                
-                    except Exception as e:
-                        print(f"Error creating enhanced 3D visualization: {e}")
+                # Create enhanced 3D point cloud for first example - DISABLED
+                # if examples_shown == 0:
+                #     try:
+                #         combined_points, combined_colors = create_combined_3d_pointcloud(
+                #             original_np, reconstructed_np, mask_overlay
+                #         )
+                #         
+                #         if combined_points is not None:
+                #             # Log combined point cloud
+                #             wandb.log({
+                #                 f"{dataset_name}/enhanced_3d_comparison": wandb.Object3D({
+                #                     "type": "lidar/beta",
+                #                     "points": combined_points,
+                #                     "colors": combined_colors
+                #                 })
+                #             }, step=epoch)
+                #             
+                #             # Also log separate visible and masked point clouds
+                #             visible_points = np.argwhere((original_np > 0.5) & (mask_overlay == 0))
+                #             masked_points = np.argwhere((original_np > 0.5) & (mask_overlay == 1))
+                #             
+                #             if len(visible_points) > 0:
+                #                 wandb.log({
+                #                     f"{dataset_name}/visible_patches_3d": wandb.Object3D(visible_points.astype(np.float32))
+                #                 }, step=epoch)
+                #             
+                #             if len(masked_points) > 0:
+                #                 wandb.log({
+                #                     f"{dataset_name}/masked_patches_3d": wandb.Object3D(masked_points.astype(np.float32))
+                #                 }, step=epoch)
+                #                 
+                #     except Exception as e:
+                #         print(f"Error creating enhanced 3D visualization: {e}")
                 
                 examples_shown += 1
     
