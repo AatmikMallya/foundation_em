@@ -29,16 +29,16 @@ nvidia-smi
 echo "------------------------------------"
 python3 vol_train.py \
     --project_name "mae-3d-vol" \
-    --run_name "mae_vol_96_12_base_conv" \
+    --run_name "mask_75" \
     --shard_dir /gpfs/radev/home/am3833/scratch/volumes_96 \
     --num_workers 24 \
     --val_split 0.02 \
     --img_size 96 \
-    --patch_size 12 \
+    --patch_size 8 \
     --model_arch base_conv \
-    --epochs 50 \
-    --batch_size 128 \
-    --learning_rate 8e-5 \
+    --epochs 25 \
+    --batch_size 64 \
+    --learning_rate 5e-5 \
     --min_lr 5e-6 \
     --adam_beta1 0.9 \
     --adam_beta2 0.95 \
@@ -46,13 +46,14 @@ python3 vol_train.py \
     --weight_decay 0.05 \
     --disable_ema \
     --grad_clip_norm 1.0 \
-    --initial_masking_ratio 0.5 \
-    --final_masking_ratio 0.5 \
+    --initial_masking_ratio 0.75 \
+    --final_masking_ratio 0.75 \
     --vis_interval 5000 \
     --val_interval 2000 \
     --lr_schedule cosine \
     --use_amp \
     --amp_dtype bf16 \
     --prefetch_factor 4 \
+    --save_best_model \
 
 echo "Python script finished."

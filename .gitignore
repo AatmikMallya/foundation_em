@@ -4,3 +4,15 @@ wandb/
 venv/
 __pycache__/
 .ipynb_checkpoints/
+checkpoints/
+membrane_visualizations/
+enhanced_visualizations/
+logs/
+wandb/
+*.pt
+*.pth
+*.pkl
+*.pt
+*.pth
+*.pkl
+pyvoro_out/

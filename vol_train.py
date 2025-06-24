@@ -354,6 +354,15 @@ def main(a):
     wandb.define_metric("*", step_metric="step")
     wandb.watch(model, log_freq=1000)
 
+    # ─── Best model tracking ──────────────────────────────────────────
+    best_val_loss = float('inf')
+    best_model_path = None
+    if a.save_best_model:
+        # Create checkpoints directory
+        checkpoint_dir = Path("checkpoints")
+        checkpoint_dir.mkdir(exist_ok=True)
+        best_model_path = checkpoint_dir / f"best_model_{a.run_name}.pt"
+
     # ─── TRAIN ────────────────────────────────────────────────────────
     global_step = 0
     loss_ma = deque(maxlen=100)
@@ -416,6 +425,27 @@ def main(a):
                 eval_model = ema.get() if ema else model
                 v = run_val(val_loader, eval_model, mratio, a.use_amp, device, autocast_dtype)
                 metrics["val_loss"] = v
+                
+                # Save model if we got a new best validation loss
+                if a.save_best_model and v < best_val_loss:
+                    best_val_loss = v
+                    print(f"New best validation loss: {v:.6f} (step {global_step}) - saving model...")
+                    
+                    # Save the model state dict
+                    torch.save({
+                        'model_state_dict': model.state_dict(),
+                        'ema_state_dict': ema.get().state_dict() if ema else None,
+                        'optimizer_state_dict': optim.state_dict(),
+                        'scheduler_state_dict': scheduler.state_dict(),
+                        'global_step': global_step,
+                        'epoch': epoch + 1,
+                        'val_loss': v,
+                        'config': vars(a)
+                    }, best_model_path)
+                    
+                    # Also log to wandb that we saved a new best model
+                    metrics["best_val_loss"] = best_val_loss
+                    metrics["saved_best_model"] = True
 
             if a.vis_interval and global_step % a.vis_interval == 0:
                 try:
@@ -496,5 +526,7 @@ if __name__ == "__main__":
     # I/O optimization arguments
     P.add_argument("--prefetch_factor", type=int, default=4,
                    help="Number of batches to prefetch per worker")
+    P.add_argument("--save_best_model", action="store_true",
+                   help="Save the model when validation loss improves")
     args = P.parse_args()
     main(args)

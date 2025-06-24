@@ -135,41 +135,65 @@ class PatchEmbed3D(nn.Module):
         x = self.proj(x).flatten(2).transpose(1, 2) # B, C, Dp, Hp, Wp -> B, C, Np -> B, Np, C
         return x
 
-def get_sinusoid_encoding_table_3d(num_patches, embed_dim):
+def get_sinusoid_encoding_table_3d(num_patches: int, embed_dim: int):
+    """Axis-concatenated 3-D sine–cosine positional encoding.
+
+    Each spatial axis receives its own slice of the embedding dimension, which
+    removes the aliasing that occurs when D/H/W encodings are summed.  The
+    returned tensor has shape ``(num_patches, embed_dim)``.
     """
-    3D Sinusoidal Positional Encoding Table
-    """
-    grid_size_float = num_patches**(1/3)
-    grid_size = int(round(grid_size_float))
-    if abs(grid_size_float - grid_size) > 1e-6 or grid_size**3 != num_patches :
-        raise ValueError(f"Number of patches ({num_patches}) must be a perfect cube for 3D sinusoidal encoding.")
+    import math, torch
 
-    sinusoid_table = torch.zeros(num_patches, embed_dim)
-    
-    grid_d_coords = torch.arange(grid_size, dtype=torch.float32).unsqueeze(-1).unsqueeze(-1).expand(-1, grid_size, grid_size)
-    grid_h_coords = torch.arange(grid_size, dtype=torch.float32).unsqueeze(0).unsqueeze(-1).expand(grid_size, -1, grid_size)
-    grid_w_coords = torch.arange(grid_size, dtype=torch.float32).unsqueeze(0).unsqueeze(0).expand(grid_size, grid_size, -1)
+    # Determine cubic grid size (we assume perfect cube volumes)
+    grid_size = round(num_patches ** (1 / 3))
+    if grid_size ** 3 != num_patches:
+        raise ValueError("num_patches must be a perfect cube for 3-D positional encoding")
 
-    grid_d = grid_d_coords.flatten()
-    grid_h = grid_h_coords.flatten()
-    grid_w = grid_w_coords.flatten()
+    # Allocate embedding dimensions per axis as evenly as possible
+    dim_per_axis = embed_dim // 3
+    remainder = embed_dim % 3
+    dim_d = dim_per_axis + (1 if remainder > 0 else 0)
+    dim_h = dim_per_axis + (1 if remainder > 1 else 0)
+    dim_w = dim_per_axis  # use the floor for the last axis
 
-    emb_d = torch.zeros(num_patches, embed_dim)
-    emb_h = torch.zeros(num_patches, embed_dim)
-    emb_w = torch.zeros(num_patches, embed_dim)
+    def _axis_encoding(coord_flat: torch.Tensor, dim_axis: int):
+        """Create standard 1-D sin-cos encoding for a single axis."""
+        pe = torch.zeros(coord_flat.shape[0], dim_axis)
+        if dim_axis == 0:
+            return pe  # edge-case if embed_dim < 3
+        div_term = torch.exp(
+            torch.arange(0, dim_axis, 2, dtype=torch.float32) * (-math.log(10000.0) / dim_axis)
+        )
+        pe[:, 0::2] = torch.sin(coord_flat[:, None] * div_term)
+        if dim_axis % 2 == 0:  # even
+            pe[:, 1::2] = torch.cos(coord_flat[:, None] * div_term)
+        else:  # odd embedding dim: last odd slot gets sin only
+            pe[:, 1::2] = torch.cos(coord_flat[:, None] * div_term)[:, : pe[:, 1::2].shape[1]]
+        return pe
 
-    div_term = torch.exp(torch.arange(0, embed_dim, 2).float() * (-math.log(10000.0) / embed_dim))
+    # 3-D coordinate grids
+    d_coords = torch.arange(grid_size, dtype=torch.float32)
+    h_coords = torch.arange(grid_size, dtype=torch.float32)
+    w_coords = torch.arange(grid_size, dtype=torch.float32)
 
-    emb_d[:, 0::2] = torch.sin(grid_d[:, None] * div_term)
-    emb_d[:, 1::2] = torch.cos(grid_d[:, None] * div_term)
+    grid_d, grid_h, grid_w = torch.meshgrid(d_coords, h_coords, w_coords, indexing="ij")
 
-    emb_h[:, 0::2] = torch.sin(grid_h[:, None] * div_term)
-    emb_h[:, 1::2] = torch.cos(grid_h[:, None] * div_term)
+    grid_d = grid_d.flatten()
+    grid_h = grid_h.flatten()
+    grid_w = grid_w.flatten()
 
-    emb_w[:, 0::2] = torch.sin(grid_w[:, None] * div_term)
-    emb_w[:, 1::2] = torch.cos(grid_w[:, None] * div_term)
+    emb_d = _axis_encoding(grid_d, dim_d)
+    emb_h = _axis_encoding(grid_h, dim_h)
+    emb_w = _axis_encoding(grid_w, dim_w)
 
-    sinusoid_table = emb_d + emb_h + emb_w # Summing the positional encodings
+    # Concatenate along embedding dimension
+    sinusoid_table = torch.cat([emb_d, emb_h, emb_w], dim=-1)
+    # Ensure final size matches embed_dim (could be off by 1 due to odd dims)
+    if sinusoid_table.shape[1] < embed_dim:
+        pad = embed_dim - sinusoid_table.shape[1]
+        sinusoid_table = torch.cat([sinusoid_table, torch.zeros(num_patches, pad)], dim=-1)
+    elif sinusoid_table.shape[1] > embed_dim:
+        sinusoid_table = sinusoid_table[:, :embed_dim]
     return sinusoid_table
 
 class ViT3D(nn.Module):
@@ -206,9 +230,10 @@ class ViT3D(nn.Module):
         self.init_weights()
 
     def init_weights(self):
-        # Initialize positional embedding with truncated normal, as is standard for learnable embeddings
-        torch.nn.init.trunc_normal_(self.pos_embed, std=.02)
-        torch.nn.init.normal_(self.cls_token, std=.02)
+        # Initialize positional embedding with axis-concatenated 3-D sinusoid (CLS token kept at 0)
+        sin_table = get_sinusoid_encoding_table_3d(self.pos_embed.shape[1] - 1, self.pos_embed.shape[-1])
+        self.pos_embed.data.zero_()
+        self.pos_embed.data[:, 1:, :].copy_(sin_table.unsqueeze(0))
         self.apply(self._init_weights_linear_layernorm)
     
     def _init_weights_linear_layernorm(self, m):
