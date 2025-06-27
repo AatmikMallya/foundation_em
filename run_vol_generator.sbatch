@@ -23,4 +23,5 @@ srun python vol_generator.py \
         --shard_size 16384 \
         --queue_max 256 \
         --num_workers 8 \
-        --overwrite
+        --overwrite \
+        --generate_masks

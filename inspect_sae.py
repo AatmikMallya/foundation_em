@@ -17,6 +17,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
 from collections import defaultdict
+from scipy import ndimage
 
 # Project imports
 from vit_3d import mae_vit_3d_base_conv, get_device
@@ -161,6 +162,126 @@ def patch_coords_to_voxel_heat(activations, patch_grid_shape, patch_size):
     
     return heat_3d
 
+def analyze_synthetic_patterns(volume, heatmap, latent_id):
+    """Analyze what synthetic patterns this latent detects."""
+    if torch.is_tensor(volume):
+        volume = volume.cpu().numpy()
+    
+    # Threshold volume to separate objects from background
+    vol_thresh = volume < np.percentile(volume, 20)  # Dark regions (spheres/membranes)
+    
+    # Threshold heatmap for active regions
+    heat_thresh = heatmap > np.percentile(heatmap[heatmap > 0], 50)  # Top 50% of activations
+    
+    # Compute overlap metrics
+    overlap_with_objects = np.logical_and(vol_thresh, heat_thresh).sum()
+    overlap_with_background = np.logical_and(~vol_thresh, heat_thresh).sum()
+    total_activations = heat_thresh.sum()
+    
+    if total_activations > 0:
+        object_selectivity = overlap_with_objects / total_activations
+        background_selectivity = overlap_with_background / total_activations
+    else:
+        object_selectivity = 0
+        background_selectivity = 0
+    
+    # Analyze spatial clustering of activations
+    if total_activations > 10:
+        # Find connected components in activation map
+        labeled, num_clusters = ndimage.label(heat_thresh)
+        cluster_sizes = [np.sum(labeled == i) for i in range(1, num_clusters + 1)]
+        avg_cluster_size = np.mean(cluster_sizes) if cluster_sizes else 0
+        max_cluster_size = np.max(cluster_sizes) if cluster_sizes else 0
+    else:
+        num_clusters = 0
+        avg_cluster_size = 0
+        max_cluster_size = 0
+    
+    return {
+        'object_selectivity': object_selectivity,
+        'background_selectivity': background_selectivity, 
+        'num_clusters': num_clusters,
+        'avg_cluster_size': avg_cluster_size,
+        'max_cluster_size': max_cluster_size,
+        'total_activations': total_activations
+    }
+
+def create_enhanced_visualization(volume, heatmap, latent_id, pattern_analysis, save_dir=None):
+    """Create enhanced visualization showing multiple analysis views."""
+    # Convert to numpy
+    if torch.is_tensor(volume):
+        volume = volume.cpu().numpy()
+    
+    # Normalize volume for display
+    vol_norm = (volume - volume.min()) / (volume.max() - volume.min())
+    
+    # Create figure with enhanced layout
+    fig, axes = plt.subplots(3, 3, figsize=(15, 12))
+    
+    # Get dimensions
+    d, h, w = volume.shape
+    
+    # Show orthogonal slices through center
+    slices = [
+        (vol_norm[d//2, :, :], heatmap[d//2, :, :], 'Z-slice (sagittal)'),
+        (vol_norm[:, h//2, :], heatmap[:, h//2, :], 'Y-slice (coronal)'), 
+        (vol_norm[:, :, w//2], heatmap[:, :, w//2], 'X-slice (axial)')
+    ]
+    
+    for i, (vol_slice, heat_slice, title) in enumerate(slices):
+        # Raw volume
+        axes[0, i].imshow(vol_slice, cmap='gray')
+        axes[0, i].set_title(f'{title}\nRaw EM')
+        axes[0, i].axis('off')
+        
+        # Overlay heatmap
+        axes[1, i].imshow(vol_slice, cmap='gray')
+        axes[1, i].imshow(heat_slice, cmap='hot', alpha=0.6, vmin=0, vmax=1)
+        axes[1, i].set_title(f'{title}\nLatent {latent_id} Overlay')
+        axes[1, i].axis('off')
+        
+        # Thresholded activation regions
+        heat_binary = heat_slice > np.percentile(heat_slice[heat_slice > 0], 70) if heat_slice.max() > 0 else np.zeros_like(heat_slice)
+        axes[2, i].imshow(vol_slice, cmap='gray')
+        axes[2, i].imshow(heat_binary, cmap='Reds', alpha=0.8, vmin=0, vmax=1)
+        axes[2, i].set_title(f'{title}\nTop 30% Activations')
+        axes[2, i].axis('off')
+    
+    # Add analysis text
+    analysis_text = f"""
+Latent {latent_id} Analysis:
+Object Selectivity: {pattern_analysis['object_selectivity']:.2f}
+Background Selectivity: {pattern_analysis['background_selectivity']:.2f}
+Activation Clusters: {pattern_analysis['num_clusters']}
+Avg Cluster Size: {pattern_analysis['avg_cluster_size']:.1f}
+Max Cluster Size: {pattern_analysis['max_cluster_size']}
+Total Activations: {pattern_analysis['total_activations']}
+
+Interpretation:
+{'Prefers objects (spheres/membranes)' if pattern_analysis['object_selectivity'] > 0.6 else 
+ 'Prefers background' if pattern_analysis['background_selectivity'] > 0.6 else 
+ 'Mixed object/background'}
+{'Highly clustered' if pattern_analysis['num_clusters'] < 5 and pattern_analysis['total_activations'] > 50 else
+ 'Scattered pattern' if pattern_analysis['num_clusters'] > 20 else
+ 'Moderate clustering'}
+    """.strip()
+    
+    fig.text(0.02, 0.02, analysis_text, fontsize=10, verticalalignment='bottom', 
+             bbox=dict(boxstyle="round,pad=0.5", facecolor="lightgray", alpha=0.8))
+    
+    plt.suptitle(f'Enhanced Analysis: Latent {latent_id}', fontsize=16)
+    plt.tight_layout()
+    plt.subplots_adjust(bottom=0.25)  # Make room for text
+    
+    if save_dir:
+        save_path = Path(save_dir) / f'latent_{latent_id:04d}_enhanced.png'
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        return save_path
+    else:
+        plt.show()
+        return None
+
 def visualize_latent_on_volume(volume, heatmap, latent_id, save_dir=None):
     """Create overlay visualization of latent activation on raw EM volume."""
     # Convert to numpy
@@ -283,6 +404,7 @@ def main():
     parser.add_argument('--output_dir', default='sae_inspection', help='Output directory for visualizations')
     parser.add_argument('--num_latents', type=int, default=20, help='Number of top latents to visualize')
     parser.add_argument('--batch_size', type=int, default=4, help='Number of volumes to analyze')
+    parser.add_argument('--enhanced', action='store_true', help='Enable enhanced analysis for synthetic data')
     
     args = parser.parse_args()
     
@@ -357,7 +479,9 @@ def main():
     grid_size = img_size // patch_size
     patch_grid_shape = (grid_size, grid_size, grid_size)
     
-    # Visualize top latents
+    # Visualize top latents with enhanced analysis
+    pattern_analyses = []
+    
     for i, latent_idx in enumerate(top_latent_indices):
         print(f"Processing latent {latent_idx} ({i+1}/{args.num_latents})")
         
@@ -373,17 +497,62 @@ def main():
         # Get corresponding raw volume
         raw_volume = volumes[0, 0]  # First volume, single channel
         
-        # Create visualization
-        save_path = visualize_latent_on_volume(raw_volume, heatmap, latent_idx, args.output_dir)
+        if args.enhanced:
+            # Analyze synthetic patterns
+            pattern_analysis = analyze_synthetic_patterns(raw_volume, heatmap, latent_idx)
+            pattern_analyses.append((latent_idx, pattern_analysis))
+            
+            # Create enhanced visualization
+            enhanced_path = create_enhanced_visualization(raw_volume, heatmap, latent_idx, pattern_analysis, args.output_dir)
+            
+            # Create standard visualization for comparison
+            standard_path = visualize_latent_on_volume(raw_volume, heatmap, latent_idx, args.output_dir)
+        else:
+            # Standard visualization only
+            standard_path = visualize_latent_on_volume(raw_volume, heatmap, latent_idx, args.output_dir)
+            pattern_analysis = None
         
         print(f"  Active fraction: {stats['frac_active'][latent_idx]*100:.2f}%")
         print(f"  Total mass: {stats['total_mass'][latent_idx]:.3f}")
-        print(f"  Saved to: {save_path}")
+        
+        if args.enhanced and pattern_analysis is not None:
+            print(f"  Object selectivity: {pattern_analysis['object_selectivity']:.3f}")
+            print(f"  Activation clusters: {pattern_analysis['num_clusters']}")
+            print(f"  Enhanced viz: {enhanced_path}")
+            print(f"  Standard viz: {standard_path}")
+        else:
+            print(f"  Saved to: {standard_path}")
+    
+    # Summary of pattern analysis (only if enhanced mode)
+    if args.enhanced and pattern_analyses:
+        print(f"\n=== PATTERN ANALYSIS SUMMARY ===")
+        object_selective = [p for _, p in pattern_analyses if p['object_selectivity'] > 0.6]
+        background_selective = [p for _, p in pattern_analyses if p['background_selectivity'] > 0.6]
+        clustered = [p for _, p in pattern_analyses if p['num_clusters'] < 5 and p['total_activations'] > 50]
+        
+        print(f"Object-selective latents: {len(object_selective)}/{len(pattern_analyses)}")
+        print(f"Background-selective latents: {len(background_selective)}/{len(pattern_analyses)}")
+        print(f"Highly clustered latents: {len(clustered)}/{len(pattern_analyses)}")
+        
+        if len(object_selective) == 0:
+            print("\n⚠️  WARNING: No latents show strong preference for spheres/membranes!")
+            print("   This suggests the SAE may not be learning meaningful geometric features.")
+            print("   Consider: lower L1 coefficient, different layer, or more training.")
+        
+        if len(clustered) == 0:
+            print("\n⚠️  WARNING: No latents show spatially coherent activation patterns!")
+            print("   This suggests scattered/noisy feature detection rather than clean patterns.")
+            print("   Consider: longer training, different patch size, or layer selection.")
     
     print(f"\nInspection complete! Results saved to {args.output_dir}")
     print(f"Key files:")
     print(f"  - sae_summary_stats.png: Overall SAE statistics")
-    print(f"  - latent_XXXX_overlay.png: Individual latent visualizations")
+    if args.enhanced:
+        print(f"  - latent_XXXX_enhanced.png: Enhanced analysis with pattern metrics")
+        print(f"  - latent_XXXX_overlay.png: Standard overlay visualizations")
+    else:
+        print(f"  - latent_XXXX_overlay.png: Individual latent visualizations")
+        print(f"\nTip: Use --enhanced flag for synthetic data analysis with pattern metrics")
 
 if __name__ == "__main__":
     main() 
