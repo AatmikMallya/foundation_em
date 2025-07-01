@@ -28,12 +28,12 @@ _dg, _hg, _wg = np.ogrid[:D, :H, :W]
 class MembraneGen:
     def __init__(self, generate_masks=False):
         # static params baked in; adapt if needed
-        self.n_gauss = (4, 6); self.sigma = (35, 45)  # Increased from (20,25) for larger membranes
-        self.iso, self.band = 0.8, 0.08  # Keep thin membranes (restored from 0.15)
-        self.noise = 0.02
-        self.n_sph, self.sph_r = (12, 12), (6., 6.)
-        self.n_cube, self.cube_size = (12, 12), (16., 16.)
-        self.blur, self.iso_var, self.grad = 1.0, 0.3, 0.2
+        self.n_gauss = (2, 4); self.sigma = (35, 45)  # Reduced from (4,6) for simpler membranes
+        self.iso, self.band = 0.8, 0.08  # Keep thin membranes
+        self.noise = 0.01  # Reduced from 0.02
+        self.n_sph, self.sph_r = (6, 6), (8., 8.) # Exactly 6 spheres of radius 8
+        self.n_cube, self.cube_size = (4, 4), (12., 12.) # 4 cubes of size 12
+        self.blur, self.iso_var, self.grad = 0.5, 0.2, 0.2 # Reduced blur and iso_var
         self.bg, self.mem, self.sph, self.cube = 0.72, 0.22, 0.03, 0.05
         self.generate_masks = generate_masks
 
@@ -96,7 +96,7 @@ class MembraneGen:
         placed_spheres = 0
         
         for _ in range(target_spheres):
-            cd,ch,cw = rng.uniform(0,D),rng.uniform(0,H),rng.uniform(0,W)
+                cd,ch,cw = rng.uniform(0,D),rng.uniform(0,H),rng.uniform(0,W)
             r = rng.uniform(*self.sph_r)
             
             # Fast distance-based membrane collision check
@@ -113,7 +113,7 @@ class MembraneGen:
                 sph_mask = ((_dg-cd)**2+(_hg-ch)**2+(_wg-cw)**2)<r*r
                 sval=np.clip(self.sph+rng.uniform(-0.02,0.02),0.01,0.15)
                 vol[sph_mask]=sval
-                
+
                 if self.generate_masks:
                     seg_mask[sph_mask] = 2  # 2 = sphere
                 
@@ -121,21 +121,20 @@ class MembraneGen:
                 placed_radii.append(r)
                 placed_spheres += 1
 
-        # Generate rectangular prisms (cubes) with collision detection (including membrane avoidance)
+        # Generate cubes with collision detection (including membrane avoidance)
         nc0,nc1 = self.n_cube
         target_cubes = rng.randint(nc0, nc1+1) if nc1 > 0 else 0
         placed_cubes = 0
         
         for _ in range(target_cubes):
             cd,ch,cw = rng.uniform(0,D),rng.uniform(0,H),rng.uniform(0,W)
-            cube_size = rng.uniform(*self.cube_size)
-            
-            # For collision detection, use half the cube diagonal as effective radius
-            effective_radius = cube_size * 0.866  # sqrt(3)/2 for cube diagonal
+            size = rng.uniform(*self.cube_size)
             
             # Fast distance-based membrane collision check
             center_coords = (int(np.clip(cd, 0, D-1)), int(np.clip(ch, 0, H-1)), int(np.clip(cw, 0, W-1)))
             min_gap = 2.0
+            # Use half-diagonal of cube as effective radius for collision check
+            effective_radius = size * np.sqrt(3) / 2
             membrane_clear = dist_to_membrane[center_coords] >= (effective_radius + min_gap)
             
             # Vectorized collision check with other organelles
@@ -144,21 +143,21 @@ class MembraneGen:
             organelle_clear = not self.check_collision_vectorized(placed_centers_arr, placed_radii_arr, (cd,ch,cw), effective_radius)
             
             if membrane_clear and organelle_clear:
-                half_d = cube_size / 2
-                half_h = cube_size / 2  
-                half_w = cube_size / 2
+                # Create cube mask
+                half_size = size / 2
+                cube_mask = (
+                    (np.abs(_dg - cd) <= half_size) &
+                    (np.abs(_hg - ch) <= half_size) &
+                    (np.abs(_wg - cw) <= half_size)
+                )
                 
-                cube_mask = ((_dg >= cd - half_d) & (_dg <= cd + half_d) &
-                           (_hg >= ch - half_h) & (_hg <= ch + half_h) &
-                           (_wg >= cw - half_w) & (_wg <= cw + half_w))
-                
-                cval=np.clip(self.cube+rng.uniform(-0.02,0.02),0.01,0.15)
-                vol[cube_mask]=cval
-                
+                cval = np.clip(self.cube + rng.uniform(-0.02, 0.02), 0.01, 0.15)
+                vol[cube_mask] = cval
+
                 if self.generate_masks:
                     seg_mask[cube_mask] = 3  # 3 = cube
                 
-                placed_centers.append((cd,ch,cw))
+                placed_centers.append((cd, ch, cw))
                 placed_radii.append(effective_radius)
                 placed_cubes += 1
 
@@ -183,7 +182,7 @@ class MembraneGen:
         if self.generate_masks:
             return vol.tobytes(), seg_mask.tobytes()
         else:
-            return vol.tobytes()
+        return vol.tobytes()
 
 
 # ─────────────────────────── worker loop ─────────────────────────────── #

@@ -9,7 +9,7 @@
 #SBATCH --mem-per-cpu=10G
 #SBATCH --time=2-00:00:00
 #SBATCH --partition=gpu
-#SBATCH --gpus=h100:1
+#SBATCH --gpus=h200:1
 #SBATCH --signal=TERM@120
 
 mkdir -p logs
@@ -29,15 +29,15 @@ nvidia-smi
 echo "------------------------------------"
 python3 vol_train.py \
     --project_name "mae-3d-vol" \
-    --run_name "mask_75" \
+    --run_name "mask_75_v2_base" \
     --shard_dir /gpfs/radev/home/am3833/scratch/volumes_96 \
     --num_workers 24 \
     --val_split 0.02 \
     --img_size 96 \
     --patch_size 8 \
-    --model_arch base_conv \
-    --epochs 25 \
-    --batch_size 64 \
+    --model_arch base \
+    --epochs 15 \
+    --batch_size 256 \
     --learning_rate 5e-5 \
     --min_lr 5e-6 \
     --adam_beta1 0.9 \

@@ -20,24 +20,28 @@ source venv/bin/activate
 
 # Tune for I/O throughput
 export CUDA_LAUNCH_BLOCKING=0
-export RUN_NAME="sae_layer2_lat3_mask75_v2_lambda_1e-3_lr_8e-4"
+export RUN_NAME="base_layer8_lat4_k32_lr1e-3"
 
 
 python3 sae_train.py \
     --project_name "sae-3d-vol" \
     --run_name $RUN_NAME \
     --shard_dir /gpfs/radev/home/am3833/scratch/volumes_96 \
-    --checkpoint checkpoints/best_model_mask_75.pt \
+    --checkpoint checkpoints/best_model_mask_75_v2.pt \
     --output_path checkpoints/sae/$RUN_NAME.pt \
-    --model_arch base_conv \
+    --model_arch base \
     --img_size 96 \
     --patch_size 8 \
-    --layer 2 \
-    --latent_dim_multiplier 3 \
-    --l1_coeff 1e-3 \
+    --extract_from encoder \
+    --layer 8 \
+    --latent_dim_multiplier 4 \
+    --k_sparse 32 \
+    --l1_coeff 1e-6 \
     --batch_size 128 \
-    --learning_rate 8e-4 \
-    --epochs 10 \
+    --learning_rate 1e-3 \
+    --total_steps 10000 \
+    --use_cosine_decay \
+    --warmup_steps 500 \
     --activation relu \
     --num_workers 32 \
     --prefetch_factor 4 \
@@ -48,9 +52,11 @@ python3 sae_train.py \
     --amp_dtype bf16 \
     --grad_clip_norm 1.0 \
     --train_log_interval 10 \
-    --l1_tune_interval 999999 \
     --dead_threshold 12500 \
     --resample_interval 25000 \
+    --sae_variant linear \
+    --compile_sae \
+    --compile_mae \
 
     
  

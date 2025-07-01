@@ -16,3 +16,6 @@ wandb/
 *.pth
 *.pkl
 pyvoro_out/
+media/
+images/
+*.png

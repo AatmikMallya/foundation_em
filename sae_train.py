@@ -30,6 +30,7 @@ L1 coefficient and dataclass-style hyper-parameters for downstream use
 import argparse, math, random, signal, time
 from pathlib import Path
 from collections import deque
+from typing import Optional
 
     # ───────────────────────── 3rd-party
 import torch, torch.nn.functional as F
@@ -60,9 +61,14 @@ class LinearSAE(torch.nn.Module):
     - Both encoder bias (b_e) and decoder bias (b_d)
     - Gradient projection for proper dictionary normalization
     """
-    def __init__(self, input_dim: int, latent_dim: int, activation: str = "relu"):
+    def __init__(self, input_dim: int, latent_dim: int, activation: str = "relu", k_sparse: Optional[int] = None):
         super().__init__()
         self.activation = activation
+        
+        # If k_sparse is provided (>0) we will keep only the k strongest (absolute) activations per token
+        if k_sparse is not None and k_sparse <= 0:
+            raise ValueError("k_sparse must be a positive integer or None")
+        self.k_sparse = k_sparse
         
         # Encoder weights and bias
         self.encoder_weight = torch.nn.Parameter(torch.empty(latent_dim, input_dim))
@@ -100,6 +106,16 @@ class LinearSAE(torch.nn.Module):
 
     def forward(self, x):
         f = self.encode(x)
+        # ─── k-winners sparsity (top-k) ────────────────────────────
+        if self.k_sparse is not None:
+            # Keep sign and magnitude of the k strongest activations per sample
+            # Compute absolute values to find strongest activations regardless of sign
+            with torch.no_grad():
+                topk_idx = torch.topk(f.abs(), k=self.k_sparse, dim=1, largest=True, sorted=False).indices
+                mask = torch.zeros_like(f, dtype=torch.bool)
+                mask.scatter_(1, topk_idx, True)
+            f = f * mask.float()
+
         x_hat = self.decode(f)
         return x_hat, f
     
@@ -181,20 +197,96 @@ class LinearSAE(torch.nn.Module):
         
         return len(dead_to_resample)
 
+# ═════════════════════════ Gated Top-K SAE ═════════════════════════════
+class GatedSAE(torch.nn.Module):
+    """Encoder is split into a binary *gate* pathway and a ReLU magnitude pathway.
+    L1 penalty is applied only to the gate, avoiding shrinkage.
+    Optionally keep only k strongest magnitudes per token (Top-K).
+    """
+    def __init__(self, input_dim:int, latent_dim:int, k_sparse:Optional[int]=None):
+        super().__init__()
+        self.activation="relu"  # for compatibility with helper functions
+        if k_sparse is not None and k_sparse<=0:
+            raise ValueError("k_sparse must be positive or None")
+        self.k_sparse = k_sparse
+        # magnitude encoder
+        self.mag_weight  = torch.nn.Parameter(torch.empty(latent_dim, input_dim))
+        self.mag_bias    = torch.nn.Parameter(torch.zeros(latent_dim))
+        # gate encoder
+        self.gate_weight = torch.nn.Parameter(torch.empty(latent_dim, input_dim))
+        self.gate_bias   = torch.nn.Parameter(torch.zeros(latent_dim))
+        # decoder
+        self.decoder_weight = torch.nn.Parameter(torch.empty(latent_dim, input_dim))
+        self.decoder_bias   = torch.nn.Parameter(torch.zeros(input_dim))
+        # init
+        torch.nn.init.kaiming_uniform_(self.mag_weight, a=math.sqrt(5))
+        torch.nn.init.kaiming_uniform_(self.gate_weight, a=math.sqrt(5))
+        torch.nn.init.kaiming_uniform_(self.decoder_weight, a=math.sqrt(5))
+
+        # dead latent tracking buffers (re-use code later)
+        self.register_buffer('latent_acts', torch.zeros(latent_dim))
+        self.register_buffer('steps_since_active', torch.zeros(latent_dim, dtype=torch.long))
+
+    def encode(self,x):
+        x_c = x - self.decoder_bias
+        mag = F.relu(F.linear(x_c, self.mag_weight,  self.mag_bias))
+        gate_pre = F.linear(x_c, self.gate_weight, self.gate_bias)
+        gate_prob = torch.sigmoid(gate_pre)
+        # straight-through binary gate
+        gate_bin = (gate_prob>0.5).float()
+        gate = gate_prob + (gate_bin - gate_prob).detach()
+        if self.k_sparse is not None:
+            with torch.no_grad():
+                topk_idx = torch.topk(mag, k=self.k_sparse, dim=1, largest=True, sorted=False).indices
+                mask = torch.zeros_like(mag, dtype=torch.bool)
+                mask.scatter_(1, topk_idx, True)
+            mag = mag*mask.float()
+        z = gate * mag
+        return z, gate
+
+    def decode(self,f):
+        return f @ self.decoder_weight + self.decoder_bias
+
+    def forward(self,x):
+        z, gate = self.encode(x)
+        recon = self.decode(z)
+        return recon, z, gate
+
+    # reuse helper functions from LinearSAE
+    normalize_decoder_weights_proper = LinearSAE.normalize_decoder_weights_proper
+    apply_gradient_projection       = LinearSAE.apply_gradient_projection
+    update_dead_latent_stats        = LinearSAE.update_dead_latent_stats
+    resample_dead_latents_anthropic = LinearSAE.resample_dead_latents_anthropic
+
 # ═════════════════════════ helpers ═════════════════════════════════════
 class TokenExtractor:
-    """Optimized token extractor that registers hook once for better GPU utilization."""
-    def __init__(self, model, layer_idx: int):
+    """Optimized token extractor that can extract from various points in the MAE model."""
+    def __init__(self, model, layer_idx: int, extract_from: str = "encoder"):
         self.model = model
         self.layer_idx = layer_idx
+        self.extract_from = extract_from.lower()
         self.captured = {}
         
-        # Register hook once at initialization
-        def _hook(_module, _inp, out):
-            # out: (B, 1+L, C).  Drop CLS token.
-            self.captured["act"] = out[:, 1:, :].detach()  # (B, L, C)
-        
-        self.handle = model.encoder.blocks[layer_idx].register_forward_hook(_hook)
+        if self.extract_from == "patchembed":
+            # Extract from PatchEmbed output (raw CNN features)
+            def _hook(_module, _inp, out):
+                # out: (B, L, C) - direct patch embeddings
+                self.captured["act"] = out.detach()  # (B, L, C)
+            
+            self.handle = model.encoder.patch_embed.register_forward_hook(_hook)
+            print(f"TokenExtractor: Extracting from PatchEmbed output (raw CNN features)")
+            
+        elif self.extract_from == "encoder":
+            # Extract from encoder block (default behavior)
+            def _hook(_module, _inp, out):
+                # out: (B, 1+L, C).  Drop CLS token.
+                self.captured["act"] = out[:, 1:, :].detach()  # (B, L, C)
+            
+            self.handle = model.encoder.blocks[layer_idx].register_forward_hook(_hook)
+            print(f"TokenExtractor: Extracting from encoder block {layer_idx}")
+            
+        else:
+            raise ValueError(f"Unknown extract_from: {extract_from}. Use 'patchembed' or 'encoder'")
     
     @torch.no_grad()
     def extract_tokens(self, volumes):
@@ -202,10 +294,17 @@ class TokenExtractor:
         # Clear previous activations
         self.captured.clear()
         
-        # Forward pass (mask_ratio=0 ⇒ no masking ⇒ deterministic activations)
-        self.model.forward_encoder(volumes, mask_ratio=0.0)
+        if self.extract_from == "patchembed":
+            # For PatchEmbed, we only need to run through the patch embedding
+            # No masking, no encoder blocks
+            x = self.model.encoder.patch_embed(volumes)
+            # Hook will capture the output automatically
+            act = self.captured["act"].contiguous()  # (B, L, C)
+        else:
+            # For encoder blocks, run full forward_encoder
+            self.model.forward_encoder(volumes, mask_ratio=0.0)
+            act = self.captured["act"].contiguous()  # (B, L, C)
         
-        act = self.captured["act"].contiguous()  # (B, L, C)
         B, L, C = act.shape
         return act.view(B * L, C).contiguous()  # flatten tokens with optimal memory layout
     
@@ -215,9 +314,9 @@ class TokenExtractor:
             self.handle.remove()
 
 @torch.no_grad()
-def extract_patch_tokens(model, volumes, layer_idx: int):
+def extract_patch_tokens(model, volumes, layer_idx: int, extract_from: str = "encoder"):
     """Legacy function for backward compatibility - creates extractor each time."""
-    extractor = TokenExtractor(model, layer_idx)
+    extractor = TokenExtractor(model, layer_idx, extract_from=extract_from)
     try:
         return extractor.extract_tokens(volumes)
     finally:
@@ -284,18 +383,16 @@ def run_sae_validation(sae, mae, val_loader, layer_idx, device, act_mean, act_st
         
         # Process in chunks to match training
         for chunk in tokens.split(4096):  # Use smaller chunks for validation
-            recon, z = sae(chunk)
+            if args.sae_variant=="gated":
+                recon, z, gate = sae(chunk)
+                l1 = gate.abs().sum(dim=1).mean()
+            else:
+                recon, z = sae(chunk)
+                l1 = z.abs().sum(dim=1).mean()  # For linear SAE, compute L1 of activations
             mse = F.mse_loss(recon, chunk)
-            l1 = z.abs().sum(dim=1).mean()
-            # Use appropriate sparsity calculation based on activation function
-            if sae.activation == "relu":
-                sparsity = float((z == 0).float().mean())
-            else:  # gelu or other signed activations
-                sparsity = float((z.abs() < 1e-6).float().mean())
-            
-            val_mses.append(float(mse))
-            val_l1s.append(float(l1))
-            val_sparsities.append(sparsity)
+            val_mses.append(float(mse.detach()))
+            val_l1s.append(float(l1.detach()))
+            val_sparsities.append(float((z.detach().abs() < 1e-6).float().mean()))
         
         batch_count += 1
     
@@ -398,11 +495,18 @@ def train_sae(args):
             print(f"Unexpected keys (first 5): {missing.unexpected_keys[:5]}")
 
     # Compile MAE for faster inference AFTER loading checkpoint
-    mae = torch.compile(mae, backend="inductor", mode="default")
+    if args.compile_mae:
+        mae = torch.compile(mae, backend="inductor", mode="default")
+        print("MAE backbone compiled with torch.compile")
+    else:
+        print("torch.compile disabled for MAE – avoiding potential memory leak")
 
     # Create optimized token extractor (register hook once)
-    token_extractor = TokenExtractor(mae, args.layer)
-    print(f"Token extractor created for layer {args.layer}")
+    token_extractor = TokenExtractor(mae, args.layer, extract_from=args.extract_from)
+    if args.extract_from == "patchembed":
+        print(f"Token extractor created for PatchEmbed output (raw CNN features)")
+    else:
+        print(f"Token extractor created for encoder layer {args.layer}")
     
     # Determine token dimension C from model
     dummy = torch.zeros(1, 1, args.img_size, args.img_size, args.img_size)
@@ -422,39 +526,103 @@ def train_sae(args):
         act_std  = samp_tok.std(0, keepdim=True).clamp_(min=1e-6)
     print("Whitening stats ready → mean/std vectors shape", act_mean.shape)
 
-    sae = LinearSAE(C, latent_dim, activation=args.activation).to(device)
+    if args.sae_variant=="linear":
+        sae = LinearSAE(C, latent_dim, activation=args.activation, k_sparse=args.k_sparse).to(device)
+    elif args.sae_variant=="gated":
+        sae = GatedSAE(C, latent_dim, k_sparse=args.k_sparse).to(device)
+    else:
+        raise ValueError("unknown sae_variant")
     
     # Debug: print parameter shapes
-    print(f"Encoder weight shape: {sae.encoder_weight.shape}")
-    print(f"Encoder bias shape: {sae.encoder_bias.shape}")
+    if args.sae_variant=="linear":
+        print(f"Encoder weight shape: {sae.encoder_weight.shape}")
+        print(f"Encoder bias shape: {sae.encoder_bias.shape}")
+    else:
+        print(f"Mag weight shape:  {sae.mag_weight.shape}")
+        print(f"Gate weight shape: {sae.gate_weight.shape}")
     print(f"Decoder weight shape: {sae.decoder_weight.shape}")
     print(f"Decoder bias shape: {sae.decoder_bias.shape}")
     
-    # ─── Model compilation for speed ────────────────────────────────────────
-    sae = torch.compile(sae, backend="inductor", mode="default")
+    # ─── Model compilation for speed (optional) ─────────────────────────────
+    if args.compile_sae:
+        sae = torch.compile(sae, backend="inductor", mode="default")
+        print("SAE compiled with torch.compile")
+    else:
+        print("torch.compile disabled for SAE – avoiding potential memory leak")
 
     
     # Debug: test forward pass with dummy data
     with torch.no_grad():
         dummy_tokens = torch.randn(10, C, device=device)  # 10 tokens, C dimensions
-        try:
+        if args.sae_variant=="gated":
+            dummy_recon, dummy_f, _ = sae(dummy_tokens)
+        else:
             dummy_recon, dummy_f = sae(dummy_tokens)
-            print(f"Forward pass test successful:")
-            print(f"  Input: {dummy_tokens.shape}")
-            print(f"  Features: {dummy_f.shape}")
-            print(f"  Reconstruction: {dummy_recon.shape}")
-        except Exception as e:
-            print(f"Forward pass test failed: {e}")
-            print(f"  Input shape: {dummy_tokens.shape}")
-            raise
+        print(f"Forward pass test successful:")
+        print(f"  Input: {dummy_tokens.shape}")
+        print(f"  Features: {dummy_f.shape}")
+        print(f"  Reconstruction: {dummy_recon.shape}")
     
     # Set up optimizer with different learning rates for encoder weights vs decoder bias
-    optim = torch.optim.AdamW([
-        {'params': [sae.encoder_weight], 'lr': args.learning_rate, 'weight_decay': 1e-4},
-        {'params': [sae.encoder_bias], 'lr': args.learning_rate * 3.0, 'weight_decay': 0.0},  # Higher LR for bias, no weight decay
-        {'params': [sae.decoder_weight], 'lr': args.learning_rate, 'weight_decay': 1e-4},
-        {'params': [sae.decoder_bias], 'lr': args.learning_rate * 3.0, 'weight_decay': 0.0}  # Higher LR for bias, no weight decay
-    ])
+    if args.sae_variant=="linear":
+        param_groups = [
+            {'params': [sae.encoder_weight], 'lr': args.learning_rate, 'weight_decay': 1e-4},
+            {'params': [sae.encoder_bias],   'lr': args.learning_rate*3.0, 'weight_decay': 0.0},
+            {'params': [sae.decoder_weight], 'lr': args.learning_rate, 'weight_decay': 1e-4},
+            {'params': [sae.decoder_bias],   'lr': args.learning_rate*3.0, 'weight_decay': 0.0},
+        ]
+    else:  # gated
+        param_groups = [
+            {'params': [sae.mag_weight, sae.gate_weight], 'lr': args.learning_rate, 'weight_decay': 1e-4},
+            {'params': [sae.mag_bias, sae.gate_bias],     'lr': args.learning_rate*3.0, 'weight_decay': 0.0},
+            {'params': [sae.decoder_weight],              'lr': args.learning_rate, 'weight_decay': 1e-4},
+            {'params': [sae.decoder_bias],                'lr': args.learning_rate*3.0, 'weight_decay': 0.0},
+        ]
+    optim = torch.optim.AdamW(param_groups)
+    
+    # Debug: Print parameter group information
+    print(f"Parameter groups setup for {args.sae_variant} SAE:")
+    for i, group in enumerate(param_groups):
+        lr = group['lr']
+        num_params = len(group['params'])
+        param_shapes = [list(p.shape) for p in group['params']]
+        print(f"  Group {i}: lr={lr:.2e}, {num_params} parameters, shapes={param_shapes}")
+    
+    print(f"Warmup target LR: {args.learning_rate:.2e} (bias groups will get 3x = {args.learning_rate*3:.2e})")
+    
+    # Determine number of epochs / total steps --------------------------------
+    steps_per_epoch = len(loader)
+    if args.total_steps is not None:
+        total_steps_budget = args.total_steps
+        num_epochs = math.ceil(total_steps_budget / steps_per_epoch)
+        print(f"[config] total_steps={total_steps_budget} → computed epochs={num_epochs}")
+    else:
+        num_epochs = args.epochs
+        total_steps_budget = steps_per_epoch * num_epochs
+        print(f"[config] epochs={num_epochs} → total_steps={total_steps_budget}")
+
+    # Set up learning rate scheduler
+    if args.use_cosine_decay:
+        # total_steps_budget computed above
+        total_steps = total_steps_budget
+        warmup_steps = args.warmup_steps
+        
+        # Cosine annealing scheduler with warmup
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optim, 
+            T_max=total_steps - warmup_steps,
+            eta_min=args.min_learning_rate
+        )
+        
+        # Simple warmup function
+        def get_warmup_lr(step):
+            if step < warmup_steps:
+                return args.learning_rate * (step / warmup_steps)
+            return args.learning_rate
+        
+        print(f"Using cosine decay: warmup for {warmup_steps} steps, then decay to {args.min_learning_rate}")
+    else:
+        scheduler = None
     
     # Determine autocast dtype (bf16 recommended for H100)
     autocast_dtype = _AMP_DTYPE_MAP.get(args.amp_dtype, torch.bfloat16)
@@ -490,16 +658,17 @@ def train_sae(args):
     global_step, samples = 0, 0
     loss_ma = deque(maxlen=100)
     current_l1 = args.l1_coeff  # fixed L1 coeff (following Anthropic)
-    sparsity_history = 0.0      # accumulate frac_active for logging (tuning disabled)
+    sparsity_history = 0.0      # accumulate frac_active for auto-tuning
+    intervals_within_target = 0 # consecutive intervals inside target window (for freeze logic)
     high_loss_buffer = deque(maxlen=1000)  # Store high-loss tokens for resampling
     
     # Create separate CUDA stream for MAE forward pass overlap
     mae_stream = torch.cuda.Stream(device=device, priority=-1)
 
-    for epoch in range(args.epochs):
+    for epoch in range(num_epochs):
         # Use CUDA prefetcher for overlap
         prefetcher = CUDAPrefetcher(loader, device)
-        pbar = tqdm(prefetcher, desc=f"SAE E{epoch+1}/{args.epochs}", leave=False)
+        pbar = tqdm(prefetcher, desc=f"SAE E{epoch+1}/{num_epochs}", leave=False)
         
         # Pre-extract tokens for first batch to start pipeline
         vols_iter = iter(pbar)
@@ -512,7 +681,7 @@ def train_sae(args):
             current_tokens = token_extractor.extract_tokens(current_vols)
         
         for next_vols in vols_iter:
-            if cancel["stop"]:
+            if cancel["stop"] or global_step >= total_steps_budget:
                 break
             global_step += 1
             
@@ -531,10 +700,16 @@ def train_sae(args):
             with torch.cuda.amp.autocast(enabled=args.use_amp, dtype=autocast_dtype):
                 # Whitening
                 tokens_wh = (tokens - act_mean) / act_std
-                recon, z = sae(tokens_wh)
+                if args.sae_variant=="gated":
+                    recon, z, gate = sae(tokens_wh)
+                else:
+                    recon, z = sae(tokens_wh)
                 mse = F.mse_loss(recon, tokens_wh)
-                l1 = z.abs().sum(dim=1).mean()
-                loss = mse + current_l1 * l1
+                if args.sae_variant=="gated":
+                    gate_l1 = gate.abs().sum(dim=1).mean()
+                    loss = mse + current_l1*gate_l1
+                else:
+                    loss = mse
 
             # Fail fast if loss is NaN or Inf
             if not torch.isfinite(loss):
@@ -542,12 +717,13 @@ def train_sae(args):
 
             # Store high-loss tokens for dead latent resampling
             with torch.no_grad():
-                token_losses = F.mse_loss(recon, tokens_wh, reduction='none').mean(dim=1)
+                detached_tokens_wh = tokens_wh.detach()
+                token_losses = F.mse_loss(recon.detach(), detached_tokens_wh, reduction='none').mean(dim=1)
                 # Get top 10% highest loss tokens
                 if len(token_losses) > 10:
                     k = max(1, len(token_losses) // 10)
                     high_loss_indices = torch.topk(token_losses, k).indices
-                    high_loss_tokens = tokens_wh[high_loss_indices].detach().cpu()
+                    high_loss_tokens = detached_tokens_wh[high_loss_indices].cpu()
                     high_loss_buffer.extend(high_loss_tokens)
 
             # Backward pass and optimization step
@@ -569,6 +745,25 @@ def train_sae(args):
                 # Apply gradient projection before optimizer step (Anthropic method)
                 sae.apply_gradient_projection()
                 optim.step()
+                
+            # Update learning rate scheduler
+            if scheduler is not None:
+                if args.use_cosine_decay and global_step < warmup_steps:
+                    # Manual warmup
+                    warmup_lr = get_warmup_lr(global_step)
+                    for i, param_group in enumerate(optim.param_groups):
+                        if i % 2 == 0:  # weight parameters (even indices: encoder_weight, decoder_weight)
+                            param_group['lr'] = warmup_lr
+                        else:  # bias parameters (odd indices: encoder_bias, decoder_bias)
+                            param_group['lr'] = warmup_lr * 3.0
+                elif args.use_cosine_decay and global_step >= warmup_steps:
+                    # Cosine decay after warmup
+                    scheduler.step()
+                    # Apply 3x multiplier to bias learning rates
+                    base_lr = scheduler.get_last_lr()[0]
+                    for i, param_group in enumerate(optim.param_groups):
+                        if i % 2 == 1:  # bias parameters (odd indices)
+                            param_group['lr'] = base_lr * 3.0
 
             # Post-optimization steps (Anthropic-style)
             with torch.no_grad():
@@ -576,7 +771,7 @@ def train_sae(args):
                 sae.normalize_decoder_weights_proper()
                 
                 # 2. Update dead latent tracking
-                sae.update_dead_latent_stats(z)
+                sae.update_dead_latent_stats(z.detach())
                 
                 # 3. Dead latent resampling
                 if global_step % args.resample_interval == 0 and len(high_loss_buffer) > 0:
@@ -596,14 +791,14 @@ def train_sae(args):
                                         state['exp_avg_sq'][sae.steps_since_active > args.dead_threshold] = 0
 
             # Store moving-average loss (like vol_train.py)
-            loss_ma.append(loss.detach())
+            loss_ma.append(float(loss.detach()))
             samples += tokens.shape[0]
             
             # Compute sparsity every step and accumulate for auto-tune
-            if args.activation == "relu":
-                sparsity_step = float((z == 0).float().mean())
-            else:  # gelu or other signed activations
-                sparsity_step = float((z.abs() < 1e-6).float().mean())
+            if args.sae_variant=="gated":
+                sparsity_step = float((z.detach().abs() < 1e-6).float().mean())
+            else:
+                sparsity_step = float((z.detach().abs() < 1e-6).float().mean())
             frac_active_step = 1.0 - sparsity_step
             sparsity_history += frac_active_step
             
@@ -614,10 +809,21 @@ def train_sae(args):
                 # Calculate current metrics
                 sparsity = sparsity_step
                 frac_active = frac_active_step
+                l1_val = z.detach().abs().sum(dim=1).mean() # Still compute for logging
+                
+                # For gated SAE, log separate gate and magnitude sparsity
+                if args.sae_variant=="gated":
+                    gate_sparsity = float((gate.detach() == 0).float().mean())
+                    mag_sparsity = float((z.detach() == 0).float().mean())  # After Top-K
+                    metrics.update({
+                        "gate_sparsity": gate_sparsity,
+                        "mag_sparsity": mag_sparsity,
+                    })
+                
                 metrics.update({
-                    "train_loss": float(torch.stack(tuple(loss_ma)).mean()),
-                    "train_mse": float(mse),
-                    "train_l1": float(l1),
+                    "train_loss": sum(loss_ma) / len(loss_ma) if loss_ma else 0.0,
+                    "train_mse": float(mse.detach()),
+                    "train_l1": float(l1_val), # Log the L1 value even if not in loss
                     "train_sparsity": sparsity,
                     "train_frac_active": frac_active,
                     "learning_rate": optim.param_groups[0]['lr'],
@@ -625,16 +831,32 @@ def train_sae(args):
                     "epoch": epoch + 1
                 })
 
-            # L1 coefficient tuning disabled - using fixed value like Anthropic
-            # if global_step % args.l1_tune_interval == 0 and global_step > 0:
-            #     avg_frac = sparsity_history / args.l1_tune_interval
-            #     sparsity_history = 0.0
-            #     # More aggressive L1 tuning for faster convergence
-            #     if avg_frac < 0.02:
-            #         current_l1 *= 0.5   # make code denser (more aggressive)
-            #     elif avg_frac > 0.06:
-            #         current_l1 *= 2.0   # encourage sparsity (more aggressive)
-            #     metrics["current_l1"] = current_l1
+            # ─── L1 auto-tuning ──────────────────────────────────────────
+            if (
+                args.l1_auto_tune and
+                (global_step % args.l1_tune_interval == 0) and
+                (global_step > 0)
+            ):
+                avg_frac = sparsity_history / args.l1_tune_interval
+                sparsity_history = 0.0
+
+                # Determine adjustment
+                if avg_frac < args.l1_target_low:
+                    current_l1 /= args.l1_tune_multiplier  # allow more activity
+                    intervals_within_target = 0
+                elif avg_frac > args.l1_target_high:
+                    current_l1 *= args.l1_tune_multiplier  # encourage sparsity
+                    intervals_within_target = 0
+                else:
+                    # Within target window
+                    intervals_within_target += 1
+
+                # Freeze after enough stable intervals
+                if intervals_within_target >= args.l1_freeze_after:
+                    args.l1_auto_tune = False  # disable further tuning
+                    print(f"[L1-tuner] Target maintained for {intervals_within_target} intervals — tuning frozen at λ={current_l1:.3e}")
+
+                metrics["current_l1"] = current_l1
 
             if global_step % args.val_interval == 0:
                 val_metrics = run_sae_validation(sae, mae, val_loader, args.layer, device, act_mean, act_std, token_extractor)
@@ -682,7 +904,7 @@ def train_sae(args):
 
             if global_step % 50 == 0:
                 pbar.set_postfix(
-                    loss=float(torch.stack(tuple(loss_ma)).mean()),
+                    loss=(sum(loss_ma) / len(loss_ma) if loss_ma else 0.0),
                     lr=f"{optim.param_groups[0]['lr']:.2e}",
                     sparsity=f"{sparsity:.3f}" if 'sparsity' in locals() else "N/A"
                 )
@@ -691,7 +913,7 @@ def train_sae(args):
             current_tokens = next_tokens
             current_vols = next_vols
         
-        if cancel["stop"]:
+        if cancel["stop"] or global_step >= total_steps_budget:
             break
         
         # Process the final batch
@@ -707,10 +929,16 @@ def train_sae(args):
             
             with torch.cuda.amp.autocast(enabled=args.use_amp, dtype=autocast_dtype):
                 tokens_wh = (tokens - act_mean) / act_std
-                recon, z = sae(tokens_wh)
+                if args.sae_variant=="gated":
+                    recon, z, gate = sae(tokens_wh)
+                else:
+                    recon, z = sae(tokens_wh)
                 mse = F.mse_loss(recon, tokens_wh)
-                l1 = z.abs().sum(dim=1).mean()
-                loss = mse + current_l1 * l1
+                if args.sae_variant=="gated":
+                    gate_l1 = gate.abs().sum(dim=1).mean()
+                    loss = mse + current_l1*gate_l1
+                else:
+                    loss = mse
 
             if not torch.isfinite(loss):
                 raise RuntimeError(f"Non-finite loss detected at step {global_step}: {loss.item()}")
@@ -730,13 +958,32 @@ def train_sae(args):
                 # Apply gradient projection before optimizer step (Anthropic method)
                 sae.apply_gradient_projection()
                 optim.step()
+                
+            # Update learning rate scheduler (for final batch)
+            if scheduler is not None:
+                if args.use_cosine_decay and global_step < warmup_steps:
+                    # Manual warmup
+                    warmup_lr = get_warmup_lr(global_step)
+                    for i, param_group in enumerate(optim.param_groups):
+                        if i % 2 == 0:  # weight parameters (even indices: encoder_weight, decoder_weight)
+                            param_group['lr'] = warmup_lr
+                        else:  # bias parameters (odd indices: encoder_bias, decoder_bias)
+                            param_group['lr'] = warmup_lr * 3.0
+                elif args.use_cosine_decay and global_step >= warmup_steps:
+                    # Cosine decay after warmup
+                    scheduler.step()
+                    # Apply 3x multiplier to bias learning rates
+                    base_lr = scheduler.get_last_lr()[0]
+                    for i, param_group in enumerate(optim.param_groups):
+                        if i % 2 == 1:  # bias parameters (odd indices)
+                            param_group['lr'] = base_lr * 3.0
 
             # Post-optimization steps
             with torch.no_grad():
                 sae.normalize_decoder_weights_proper()
-                sae.update_dead_latent_stats(z)
+                sae.update_dead_latent_stats(z.detach())
 
-            loss_ma.append(loss.detach())
+            loss_ma.append(float(loss.detach()))
             samples += tokens.shape[0]
 
 
@@ -781,14 +1028,16 @@ if __name__ == "__main__":
     P.add_argument("--initial_masking_ratio", type=float, default=0.0, help="Keep all patches during SAE training")
 
     # SAE specifics
-    P.add_argument("--layer", type=int, default=6, help="Encoder block index (0-based) to extract activations from")
+    P.add_argument("--layer", type=int, default=6, help="Encoder block index (0-based) to extract activations from (ignored if extract_from='patchembed')")
+    P.add_argument("--extract_from", choices=["patchembed", "encoder"], default="encoder", 
+                   help="Where to extract features: 'patchembed' for raw CNN features, 'encoder' for transformer features")
     P.add_argument("--latent_dim", type=int, default=None, help="Explicit latent size (overrides multiplier)")
     P.add_argument("--latent_dim_multiplier", type=int, default=3,
                    help="If --latent_dim not set, use multiplier × input_dim (default 3×)")
     P.add_argument("--l1_coeff", type=float, default=8e-3, help="Fixed L1 coefficient for sparsity (following Anthropic's approach)")
     P.add_argument("--l1_tune_interval", type=int, default=500, help="Steps between auto-tuning L1 coeff")
-    P.add_argument("--dead_threshold", type=int, default=200, help="Steps before a latent is considered dead")
-    P.add_argument("--resample_interval", type=int, default=500, help="Steps between dead latent resampling")
+    P.add_argument("--dead_threshold", type=int, default=20000, help="Steps before a latent is considered dead")
+    P.add_argument("--resample_interval", type=int, default=25000, help="Steps between dead latent resampling")
     P.add_argument("--activation", choices=["relu", "gelu"], default="relu", 
                    help="Activation function for SAE encoder (relu gives true zeros for sparsity)")
 
@@ -806,6 +1055,14 @@ if __name__ == "__main__":
     P.add_argument("--amp_dtype", choices=["fp16", "bf16"], default="bf16",
                    help="Autocast dtype to use when --use_amp is enabled (bf16 recommended for H100).")
     P.add_argument("--grad_clip_norm", type=float, default=1.0)
+    
+    # Learning rate scheduling
+    P.add_argument("--use_cosine_decay", action="store_true", 
+                   help="Use cosine annealing LR decay with warmup")
+    P.add_argument("--warmup_steps", type=int, default=500,
+                   help="Number of warmup steps for cosine decay")
+    P.add_argument("--min_learning_rate", type=float, default=1e-4,
+                   help="Minimum learning rate for cosine decay")
 
     # Wandb logging
     P.add_argument("--project_name", default="sae-3d-activations", help="Wandb project name")
@@ -815,6 +1072,23 @@ if __name__ == "__main__":
     P.add_argument("--output_path", default="checkpoints/sae_layer6.pt")
     P.add_argument("--save_best_model", action="store_true",
                    help="Save the SAE when validation MSE improves")
+
+    # ── L1 sparsity auto-tuning ────────────────────────────────────────────
+    P.add_argument("--l1_auto_tune", action="store_true", help="Enable automatic L1 coefficient tuning")
+    P.add_argument("--l1_target_low", type=float, default=0.01, help="Lower bound for desired fraction of active latents")
+    P.add_argument("--l1_target_high", type=float, default=0.02, help="Upper bound for desired fraction of active latents")
+    P.add_argument("--l1_tune_multiplier", type=float, default=1.5, help="Factor to multiply/divide L1 when out of target window")
+    P.add_argument("--l1_freeze_after", type=int, default=6, help="Stop tuning after this many consecutive intervals are within target window")
+
+    # k-sparse (top-k) masking
+    P.add_argument("--k_sparse", type=int, default=None, help="Number of strongest activations to keep per token")
+    # Compile flag
+    P.add_argument("--compile_sae", action="store_true", help="Compile SAE with torch.compile (may increase memory usage)")
+    P.add_argument("--compile_mae", action="store_true", help="Compile MAE with torch.compile (may increase memory usage)")
+
+    # argparse additions
+    P.add_argument("--total_steps", type=int, default=None, help="Total optimiser steps to run (overrides --epochs)")
+    P.add_argument("--sae_variant", choices=["linear","gated"], default="linear", help="SAE architecture to use")
 
     args = P.parse_args()
     train_sae(args) 
