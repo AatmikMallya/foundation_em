@@ -22,8 +22,8 @@ source venv/bin/activate
 mkdir -p logs
 
 # Configuration
-export LAYER=8
-export RUN_NAME="base_layer8_lat4_k32_lr1e-3"
+export LAYER=2
+export RUN_NAME="base_v3_layer2_lat4_k16_lr1e-3"
 export SAE_CHECKPOINT="checkpoints/best_sae_${RUN_NAME}.pt"
 VOLUME_DIR="/gpfs/radev/home/am3833/scratch/volumes_96"
 MASK_DIR="/gpfs/radev/home/am3833/scratch/volumes_96/masks"
@@ -44,7 +44,7 @@ python3 evaluate_sae_semantics_simple.py \
     --extract_from encoder \
     --layer $LAYER \
     --visualize_patches \
-    --top_neurons 3
+    --neurons_to_visualize 2851 3020 2000
 
 echo "Simple SAE semantic evaluation complete!"
 echo "Check $OUTPUT_DIR/ for results:"

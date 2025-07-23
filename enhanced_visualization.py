@@ -68,7 +68,9 @@ def draw_slice_comparison(original_slice, recon_slice, mask_overlay_slice, axes,
         return np.clip(normalized, 0.0, 1.0)
     
     original_norm = safe_normalize(original_slice)
+    original_norm = original_slice
     recon_norm = safe_normalize(recon_slice)
+    recon_norm = recon_slice
     
     # Original
     axes[0].imshow(original_norm, cmap='gray', vmin=0, vmax=1)
@@ -179,6 +181,8 @@ def enhanced_visualize_reconstructions(model, dataloader, device, epoch, mask_ra
             if patch_stats is not None:
                 mean, var = patch_stats
                 pred_for_unpatchify = pred_for_unpatchify * (var.add(1.e-6).sqrt()).cpu() + mean.cpu()
+
+            pred_for_unpatchify = pred_for_unpatchify.to(dtype=torch.float32)
             
             # Create truth-masked reconstruction
             truth_masked_recon = create_truth_masked_reconstruction(
@@ -186,9 +190,11 @@ def enhanced_visualize_reconstructions(model, dataloader, device, epoch, mask_ra
             )
             
             # Get numpy arrays
-            original_batch_np = batch_volumes.cpu().numpy()
+            original_batch_np = batch_volumes.cpu().to(dtype=torch.float32).numpy()
+            pred_for_unpatchify = pred_for_unpatchify.to(dtype=torch.float32)
+
             reconstructed_batch_np = model.unpatchify(pred_for_unpatchify).numpy()
-            truth_masked_np = truth_masked_recon.numpy()
+            truth_masked_np = truth_masked_recon.to(dtype=torch.float32).numpy()
             
             for i in range(volumes_to_device.size(0)):
                 if examples_shown >= num_examples:

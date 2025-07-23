@@ -31,12 +31,16 @@ import argparse, math, random, signal, time
 from pathlib import Path
 from collections import deque
 from typing import Optional
+from inspect import isclass
+from itertools import islice
 
     # ───────────────────────── 3rd-party
 import torch, torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import wandb
+import matplotlib.pyplot as plt
+plt.switch_backend("Agg")
 
 # AMP dtype mapping (bf16 recommended for H100)
 _AMP_DTYPE_MAP = {
@@ -45,12 +49,13 @@ _AMP_DTYPE_MAP = {
 }
 
 # ───────────────────────── project
-from vol_train import TarShardDataset, CUDAPrefetcher  # re-use optimised loaders
+from vol_train import TarShardDataset, CUDAPrefetcher, load_model_checkpoint  # re-use optimised loaders
 from vit_3d import (
     mae_vit_3d_small_conv, mae_vit_3d_base_conv, mae_vit_3d_large_conv,
-    mae_vit_3d_hemibrain_optimal_conv,
+    mae_vit_3d_hemibrain_optimal_conv, mae_vit_3d_base_patch_conv,
     get_device,
 )
+from enhanced_visualization import enhanced_visualize_reconstructions
 
 # ═════════════════════════ SAE module ═══════════════════════════════════
 class LinearSAE(torch.nn.Module):
@@ -63,6 +68,8 @@ class LinearSAE(torch.nn.Module):
     """
     def __init__(self, input_dim: int, latent_dim: int, activation: str = "relu", k_sparse: Optional[int] = None):
         super().__init__()
+        # Token-wise LayerNorm replaces external whitening
+        self.input_norm = torch.nn.Identity()     # disable for sanity check
         self.activation = activation
         
         # If k_sparse is provided (>0) we will keep only the k strongest (absolute) activations per token
@@ -88,7 +95,7 @@ class LinearSAE(torch.nn.Module):
 
     def encode(self, x):
         """Encode with Anthropic's formula: f = ReLU(W_e * (x - b_d) + b_e)"""
-        x_centered = x - self.decoder_bias  # Pre-encoder bias subtraction
+        x_centered = x - self.decoder_bias
         linear_out = F.linear(x_centered, self.encoder_weight, self.encoder_bias)
         if self.activation == "relu":
             f = F.relu(linear_out)
@@ -114,7 +121,7 @@ class LinearSAE(torch.nn.Module):
                 topk_idx = torch.topk(f.abs(), k=self.k_sparse, dim=1, largest=True, sorted=False).indices
                 mask = torch.zeros_like(f, dtype=torch.bool)
                 mask.scatter_(1, topk_idx, True)
-            f = f * mask.float()
+            f = f * mask.to(f.dtype)
 
         x_hat = self.decode(f)
         return x_hat, f
@@ -313,6 +320,344 @@ class TokenExtractor:
         if hasattr(self, 'handle'):
             self.handle.remove()
 
+class ActivationInjector:
+    """Inject modified activations back into the MAE model for reconstruction evaluation."""
+    def __init__(self, model, layer_idx: int, extract_from: str = "encoder"):
+        self.model = model
+        self.layer_idx = layer_idx
+        self.extract_from = extract_from.lower()
+        self.replacement_activations = None
+        self.original_hook = None
+        self.injection_handle = None
+        
+    def set_replacement_activations(self, activations):
+        """Set the activations to inject. Shape: (B*L, C) -> will be reshaped to (B, L, C)"""
+        self.replacement_activations = activations
+        
+    def _create_injection_hook(self, target_shape):
+        """Create a hook that replaces activations with our modified ones."""
+        def _inject_hook(module, input, output):
+            if self.replacement_activations is not None:
+                B, L_total, C = target_shape
+                # Only drop the CLS token if we're operating on an encoder block
+                if self.extract_from == "encoder":
+                    L_tokens = L_total - 1
+                else:                       # patchembed → no CLS
+                    L_tokens = L_total
+                
+                # Reshape flat activations back to (B, L, C)
+                reshaped_acts = self.replacement_activations.view(B, L_tokens, C)
+                
+                if self.extract_from == "encoder":
+                    # For encoder blocks, we need to preserve the CLS token
+                    # output is (B, 1+L, C), so we replace everything except first token
+                    modified_output = output.clone()
+                    modified_output[:, 1:, :] = reshaped_acts
+                    return modified_output
+                else:
+                    # For PatchEmbed, directly return the reshaped activations
+                    return reshaped_acts
+            return output
+        return _inject_hook
+        
+    @torch.no_grad()
+    def inject_and_reconstruct(self, volumes):
+        """Run MAE with injected activations to get modified reconstruction."""
+        if self.replacement_activations is None:
+            raise ValueError("Must call set_replacement_activations() first")
+            
+        # First, do a forward pass to get the target shape
+        if self.extract_from == "patchembed":
+            x = self.model.encoder.patch_embed(volumes)
+            target_shape = x.shape  # (B, L, C)
+            hook_target = self.model.encoder.patch_embed
+        else:
+            # For encoder blocks, we need to get the shape after the target layer
+            latent, mask, ids_restore = self.model.forward_encoder(volumes, mask_ratio=0.0)
+            # latent is (B, 1+L_visible, C) but we want full shape
+            B, _, C = latent.shape
+            # Calculate original L from volume size and patch size
+            volume_size = volumes.shape[-1]  # Assuming cubic volumes
+            patch_size = self.model.encoder.patch_embed.patch_size[0]
+            L = (volume_size // patch_size) ** 3
+            target_shape = (B, 1 + L, C)  # +1 for CLS token
+            hook_target = self.model.encoder.blocks[self.layer_idx]
+        
+        # Register the injection hook
+        injection_hook = self._create_injection_hook(target_shape)
+        self.injection_handle = hook_target.register_forward_hook(injection_hook)
+        
+        try:
+            # Run full MAE forward pass with injection
+            loss, pred, mask, _ = self.model(volumes, mask_ratio=0.0)
+            return pred, mask
+        finally:
+            # Always cleanup the hook
+            if self.injection_handle:
+                self.injection_handle.remove()
+                self.injection_handle = None
+
+    @staticmethod
+    @torch.no_grad()
+    def _reconstruct_with_mask(mae, vols, mask_ratio, injector=None):
+        """
+        Run MAE once, optionally with SAE-injected activations, and rebuild a *full*
+        volume in which **visible** patches come directly from the GT input while
+        **masked** patches are MAE predictions.
+
+        Returns
+        -------
+        rec  : (B,1,D,H,W)  rebuilt volume
+        mask : (B,L)        0=visible 1=masked (same order as patchify)
+        """
+        amp_dtype = next(mae.parameters()).dtype
+        with torch.cuda.amp.autocast(dtype=amp_dtype):
+            out  = mae(vols, mask_ratio=mask_ratio)
+            loss, pred, mask = out[0], out[1], out[2] if len(out) > 2 else None
+
+        if injector is not None:
+            injector.set_replacement_activations(injector.replacement_activations)
+            # identical mask pattern – injector only changes activations
+            _, pred, mask = injector.inject_and_reconstruct_with_masking(vols, mask_ratio)
+
+        # stitch prediction + visible GT back into a full grid
+        patchified = mae.patchify(vols).float()            # (B,L,P³C)
+        pred = pred.float()
+        patchified[mask.bool()] = pred[mask.bool()]
+        rec = mae.unpatchify(patchified)           # (B,1,D,H,W)
+        return rec, mask
+                
+    @torch.no_grad()
+    def inject_and_reconstruct_with_masking(self, volumes, mask_ratio):
+        """Run MAE with injected activations and masking to get modified reconstruction loss."""
+        if self.replacement_activations is None:
+            raise ValueError("Must call set_replacement_activations() first")
+        
+            
+        # This is more complex - for now, use a simpler approximation
+        # Run the injection without masking first
+        pred, _ = self.inject_and_reconstruct(volumes)
+        
+        # Then compute loss using MAE's loss function with a mask pattern
+        # Get original mask pattern
+        with torch.cuda.amp.autocast(dtype=next(self.model.parameters()).dtype):
+            _, _, mask_orig, _ = self.model(volumes, mask_ratio=mask_ratio)
+        
+        # Compute loss using original mask pattern
+        loss, _ = self.model.forward_loss(volumes, pred, mask_orig)
+        return loss, pred, mask_orig
+
+@torch.no_grad()
+def compute_masked_mae_loss_with_sae(mae, volumes, layer_idx, sae, device, token_extractor, extract_from="encoder", mask_ratio=0.85):
+    """Compute MAE loss with SAE-modified activations, handling masking properly."""
+    mae.eval()
+    
+    if extract_from == "patchembed":
+        # -----------------------------------------------------------
+        # 1) full PatchEmbed → C tokens               (no CLS token)
+        # -----------------------------------------------------------
+        tokens_full = mae.encoder.patch_embed(volumes)          # (B, L, C)
+        B, L, C = tokens_full.shape
+        flat = tokens_full.reshape(B * L, C)
+
+        # -----------------------------------------------------------
+        # 2) run SAE on *every* token (not just the visible ones)
+        # -----------------------------------------------------------
+        if isinstance(sae, GatedSAE):
+            sae_recon, _, _ = sae(flat)
+        else:
+            sae_recon, _ = sae(flat)
+
+        sae_tokens_full = sae_recon
+
+        # -----------------------------------------------------------
+        # 3) inject back into MAE and let MAE handle masking
+        # -----------------------------------------------------------
+        injector = ActivationInjector(mae, layer_idx,
+                                      extract_from="patchembed")
+        injector.set_replacement_activations(sae_tokens_full)   # (B*L, C)
+
+        loss_sae_masked, _, _ = injector.inject_and_reconstruct_with_masking(
+            volumes, mask_ratio
+        )
+        return float(loss_sae_masked)
+        
+    else:
+        # For encoder layer injection, we need to run up to that layer normally, then inject
+        # This is more complex and requires running partial forward passes
+        # For now, use a simpler approximation
+        
+        # Get original masked forward pass
+        latent_orig, mask, ids_restore = mae.forward_encoder(volumes, mask_ratio)
+        
+        # Extract all tokens (not just visible ones) and apply SAE
+        all_tokens = token_extractor.extract_tokens(volumes)  # This gets all patches
+        
+        if isinstance(sae, GatedSAE):
+            sae_recon, _, _ = sae(all_tokens)
+        else:
+            sae_recon, _ = sae(all_tokens)
+        
+        sae_tokens = sae_recon
+        
+        # This is an approximation - inject SAE tokens and run full forward
+        injector = ActivationInjector(mae, layer_idx, extract_from=extract_from)
+        injector.set_replacement_activations(sae_tokens)
+        loss_sae, pred_sae, _ = injector.inject_and_reconstruct_with_masking(volumes, mask_ratio)
+        return float(loss_sae)
+    
+    injector = ActivationInjector(mae, layer_idx, extract_from="patchembed")
+    injector.set_replacement_activations(x_sae.reshape(-1, x_sae.size(-1)))  # flat (B*L_vis, C)
+
+    loss_sae_masked, _, _ = injector.inject_and_reconstruct_with_masking(
+        volumes, mask_ratio
+    )
+    return float(loss_sae_masked)
+
+@torch.no_grad()
+def compute_reconstruction_mse_with_sae(
+    mae, volumes, layer_idx, sae,
+    device, token_extractor,
+    extract_from="encoder", mask_ratio=0.85
+):
+    """
+    MSE between the vanilla-MAE reconstruction and the SAE-patched one
+    (plus a few auxiliary metrics).  All heavy ops remain in bf16; we
+    cast to fp32 only for the final scalars.
+    """
+    amp_dtype = next(mae.parameters()).dtype          # bf16 in your run
+    volumes   = volumes.to(dtype=amp_dtype)           # safety first
+    mae.eval()
+
+    # ---------- 1 · plain MAE recon (no masking) --------------------
+    with torch.cuda.amp.autocast(dtype=amp_dtype):
+        loss_orig_full, pred_orig_full, *rest = mae(volumes, mask_ratio=0.0)
+        mask_orig_full = rest[0] if rest else None
+
+    # ---------- 2 · MAE recon with training mask -------------------
+    with torch.cuda.amp.autocast(dtype=amp_dtype):
+        loss_orig_masked, pred_orig_masked, *rest = mae(volumes, mask_ratio=mask_ratio)
+        mask_orig_masked = rest[0] if rest else None
+
+    # ---------- 3 · SAE-patched activations ------------------------
+    orig_tokens    = token_extractor.extract_tokens(volumes)      # bf16
+    sae_recon, _   = sae(orig_tokens)                          # bf16
+    sae_tokens     = sae_recon
+
+    injector = ActivationInjector(mae, layer_idx, extract_from)
+    injector.set_replacement_activations(sae_tokens)
+    with torch.cuda.amp.autocast(dtype=amp_dtype):
+        pred_sae_full, _ = injector.inject_and_reconstruct(volumes)
+
+    # ---------- 4 · masked MAE loss with SAE (still bf16) ----------
+    loss_sae_masked = compute_masked_mae_loss_with_sae(
+        mae, volumes, layer_idx, sae,
+        device, token_extractor, extract_from, mask_ratio
+    )
+
+    # ---------- 5 · error metrics ----------------------------------
+    # Keep everything in the same dtype for mse computations
+    mse_recon          = F.mse_loss(pred_sae_full, pred_orig_full)
+    rec_orig_full_bf16 = mae.unpatchify(pred_orig_full)           # bf16
+    rec_sae_full_bf16  = mae.unpatchify(pred_sae_full)            # bf16
+    mse_orig_vs_input  = F.mse_loss(rec_orig_full_bf16, volumes)
+    mse_sae_vs_input   = F.mse_loss(rec_sae_full_bf16,  volumes)
+
+    # ---------- 6 · cast *only scalars* to Python floats -----------
+    return {
+        "reconstruction_mse"  : float(mse_recon),
+        "orig_vs_input_mse"   : float(mse_orig_vs_input),
+        "sae_vs_input_mse"    : float(mse_sae_vs_input),
+        "orig_mae_loss"       : float(loss_orig_masked),
+        "sae_mae_loss"        : float(loss_sae_masked),
+        "mae_loss_diff"       : float(loss_sae_masked - loss_orig_masked),
+        # full-resolution volumes stay in bf16 – callers decide when to .float()
+        "pred_orig"           : rec_orig_full_bf16,
+        "pred_sae"            : rec_sae_full_bf16,
+        "mask"                : mask_orig_full,
+    }
+
+def visualize_sae_reconstructions(mae, sae, vis_loader, device, step, 
+                                layer_idx, token_extractor, model_dtype, extract_from="encoder", 
+                                num_examples=3, save_dir="vis"):
+    """Create visualization comparing original input, MAE reconstruction, and SAE-modified reconstruction."""
+    mae.eval()
+    save_dir = Path(save_dir)
+    save_dir.mkdir(exist_ok=True)
+    
+    vis_paths = []
+    
+    try:
+        for i, volumes in enumerate(vis_loader):
+            if i >= num_examples:
+                break
+                
+            volumes = volumes.to(device, dtype=model_dtype)
+            B = volumes.shape[0]
+            
+            # Get reconstructions
+            recon_data = compute_reconstruction_mse_with_sae(
+                mae, volumes, layer_idx, sae, device, token_extractor, extract_from
+            )
+            
+            pred_orig = recon_data['pred_orig'] 
+            pred_sae = recon_data['pred_sae']
+            mask = recon_data['mask']
+            
+            for b in range(min(B, num_examples - i)):
+                vol_orig = volumes[b, 0].to(torch.float32).cpu().numpy()  # Original input
+                vol_mae = pred_orig[b, 0].to(torch.float32).cpu().numpy()  # MAE reconstruction  
+                vol_sae = pred_sae[b, 0].to(torch.float32).cpu().numpy()   # SAE-modified reconstruction
+                
+                # Create comparison plot with 3 columns
+                fig, axes = plt.subplots(3, 3, figsize=(12, 12))
+                fig.suptitle(f'Step {step} - Sample {i*num_examples + b + 1}\n'
+                           f'Orig MSE: {recon_data["orig_vs_input_mse"]:.4f}, '
+                           f'SAE MSE: {recon_data["sae_vs_input_mse"]:.4f}, '
+                           f'Diff MSE: {recon_data["reconstruction_mse"]:.4f}\n'
+                           f'Orig MAE Loss: {recon_data["orig_mae_loss"]:.4f}, '
+                           f'SAE MAE Loss: {recon_data["sae_mae_loss"]:.4f}, '
+                           f'MAE Loss Diff: {recon_data["mae_loss_diff"]:.4f}')
+                
+                # Show middle slices in each dimension
+                D, H, W = vol_orig.shape
+                slices = [D//2, H//2, W//2]
+                
+                volumes_to_show = [vol_orig, vol_mae, vol_sae]
+                titles = ['Original Input', 'MAE Reconstruction', 'SAE-Modified Reconstruction']
+                
+                for col, (vol, title) in enumerate(zip(volumes_to_show, titles)):
+                    # Z slice (XY plane)
+                    axes[0, col].imshow(vol[slices[0], :, :], cmap='gray')
+                    axes[0, col].set_title(f'{title}\nZ-slice {slices[0]}')
+                    axes[0, col].axis('off')
+                    
+                    # Y slice (XZ plane) 
+                    axes[1, col].imshow(vol[:, slices[1], :], cmap='gray')
+                    axes[1, col].set_title(f'Y-slice {slices[1]}')
+                    axes[1, col].axis('off')
+                    
+                    # X slice (YZ plane)
+                    axes[2, col].imshow(vol[:, :, slices[2]], cmap='gray')
+                    axes[2, col].set_title(f'X-slice {slices[2]}')
+                    axes[2, col].axis('off')
+                
+                # plt.tight_layout()
+                
+                # Save the plot
+                save_path = save_dir / f"sae_recon_step_{step}_sample_{i*num_examples + b + 1}.png"
+                plt.savefig(save_path, dpi=100, bbox_inches='tight')
+                plt.close()
+                
+                vis_paths.append(save_path)
+                
+    except Exception as e:
+        print(f"Error in SAE visualization: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    return vis_paths
+
 @torch.no_grad()
 def extract_patch_tokens(model, volumes, layer_idx: int, extract_from: str = "encoder"):
     """Legacy function for backward compatibility - creates extractor each time."""
@@ -323,67 +668,41 @@ def extract_patch_tokens(model, volumes, layer_idx: int, extract_from: str = "en
         extractor.cleanup()
 
 @torch.no_grad()
-def compute_mae_loss_ratio(mae, volumes, layer_idx, sae, act_mean, act_std, device, token_extractor):
-    """Compute Anthropic's loss-ratio metric: (orig_loss - sae_loss) / (orig_loss - zero_loss)."""
-    mae.eval()
-    
-    # Get original activations and compute original loss
-    orig_tokens = token_extractor.extract_tokens(volumes)
-    orig_tokens_wh = (orig_tokens - act_mean) / act_std
-    
-    # Forward pass with original activations
-    def forward_with_activations(tokens_to_use):
-        # We need a way to inject activations into the MAE forward pass
-        # This is tricky without modifying the MAE, so we'll approximate
-        # by computing the "next layer" prediction loss
-        # For now, we'll use a proxy: MSE between original and modified tokens
-        return F.mse_loss(tokens_to_use, orig_tokens_wh)
-    
-    # Original loss (baseline)
-    orig_loss = forward_with_activations(orig_tokens_wh)
-    
-    # Zero loss (activations set to zero)
-    zero_tokens = torch.zeros_like(orig_tokens_wh)
-    zero_loss = forward_with_activations(zero_tokens)
-    
-    # SAE loss (activations passed through SAE)
-    sae_recon, _ = sae(orig_tokens_wh)
-    sae_loss = forward_with_activations(sae_recon)
-    
-    # Compute loss ratio
-    denominator = zero_loss - orig_loss
-    if denominator.abs() < 1e-8:
-        return 0.0
-    
-    loss_ratio = (orig_loss - sae_loss) / denominator
-    return float(loss_ratio.clamp(0, 1))  # Clamp to [0, 1] range
-
-@torch.no_grad()
-def run_sae_validation(sae, mae, val_loader, layer_idx, device, act_mean, act_std, token_extractor, max_batches=10):
+def run_sae_validation(sae, mae, val_loader, layer_idx, device, token_extractor, extract_from="encoder", sae_variant="linear", max_batches=10):
     """Run SAE validation on a subset of validation data."""
     sae.eval()
     val_losses, val_mses, val_l1s, val_sparsities = [], [], [], []
-    loss_ratios = []
+    recon_mses, orig_vs_input_mses, sae_vs_input_mses = [], [], []
+    orig_mae_losses, sae_mae_losses, mae_loss_diffs = [], [], []
+    
+    # Get model dtype to ensure input consistency
+    model_dtype = next(mae.parameters()).dtype
+
     
     batch_count = 0
     for vols in val_loader:
         if batch_count >= max_batches:
             break
         
-        vols = vols.to(device)
+        vols = vols.to(device, dtype=model_dtype)
         tokens = token_extractor.extract_tokens(vols)
-        tokens = (tokens - act_mean) / act_std  # whitening same as training
         
-        # Compute loss ratio for this batch
-        try:
-            loss_ratio = compute_mae_loss_ratio(mae, vols, layer_idx, sae, act_mean, act_std, device, token_extractor)
-            loss_ratios.append(loss_ratio)
-        except Exception as e:
-            print(f"Warning: Could not compute loss ratio: {e}")
+        # Compute reconstruction MSE for this batch (using smaller subset for speed)
+        if batch_count < 3:  # Only compute reconstruction MSE for first few batches (expensive)
+            recon_data = compute_reconstruction_mse_with_sae(
+                mae, vols, layer_idx, sae, device, token_extractor, extract_from
+            )
+            recon_mses.append(recon_data['reconstruction_mse'])
+            orig_vs_input_mses.append(recon_data['orig_vs_input_mse'])
+            sae_vs_input_mses.append(recon_data['sae_vs_input_mse'])
+            orig_mae_losses.append(recon_data['orig_mae_loss'])
+            sae_mae_losses.append(recon_data['sae_mae_loss'])
+            mae_loss_diffs.append(recon_data['mae_loss_diff'])
+
         
         # Process in chunks to match training
         for chunk in tokens.split(4096):  # Use smaller chunks for validation
-            if args.sae_variant=="gated":
+            if sae_variant=="gated":
                 recon, z, gate = sae(chunk)
                 l1 = gate.abs().sum(dim=1).mean()
             else:
@@ -404,10 +723,197 @@ def run_sae_validation(sae, mae, val_loader, layer_idx, device, act_mean, act_st
         'val_frac_active': 1.0 - (sum(val_sparsities) / len(val_sparsities)) if val_sparsities else 0.0,
     }
     
-    if loss_ratios:
-        metrics['val_loss_ratio'] = sum(loss_ratios) / len(loss_ratios)
+    # Add reconstruction metrics if available
+    if recon_mses:
+        metrics['val_reconstruction_mse'] = sum(recon_mses) / len(recon_mses)
+        metrics['val_orig_vs_input_mse'] = sum(orig_vs_input_mses) / len(orig_vs_input_mses)
+        metrics['val_sae_vs_input_mse'] = sum(sae_vs_input_mses) / len(sae_vs_input_mses)
+        
+        # Add MAE loss metrics (averaged across batches)
+        metrics['val_orig_mae_loss'] = sum(orig_mae_losses) / len(orig_mae_losses)
+        metrics['val_sae_mae_loss'] = sum(sae_mae_losses) / len(sae_mae_losses)
+        metrics['val_mae_loss_diff'] = sum(mae_loss_diffs) / len(mae_loss_diffs)
     
     return metrics
+
+
+def visualise_masked_effect(mae, sae, vols, token_extractor,
+                            layer_idx,
+                            mask_ratio=0.85):
+    """
+    Figure with:
+      GT  |  MAE recon  |  SAE-patched recon  |  Δ-error heat-map
+    on the *same* random-mask pattern.
+    """
+    model_dtype = next(mae.parameters()).dtype
+    # baseline MAE
+    base_rec, mask = ActivationInjector._reconstruct_with_mask(mae, vols, mask_ratio)
+    base_rec = base_rec.to(dtype=model_dtype)
+    vols = vols.to(dtype=model_dtype)
+
+    # prepare SAE activations
+    tokens   = token_extractor.extract_tokens(vols)
+
+    if isinstance(sae, GatedSAE):
+        sae_rec, _, _ = sae(tokens)
+    else:
+        sae_rec, _ = sae(tokens)
+    sae_tokens = sae_rec
+    sae_tokens = sae_tokens.to(dtype=model_dtype)
+    injector = ActivationInjector(mae, layer_idx)
+    injector.set_replacement_activations(sae_tokens)
+
+    # SAE-patched reconstruction
+    sae_rec_vol, _ = ActivationInjector._reconstruct_with_mask(mae, vols, mask_ratio, injector) 
+    sae_rec_vol = sae_rec_vol.to(dtype=model_dtype)
+
+    # absolute-error maps on masked voxels only
+    err_base = (base_rec - vols).abs()
+    err_base = err_base.float()
+    err_sae  = (sae_rec_vol - vols).abs()
+    err_sae = err_sae.float()
+    # keep masked voxels
+    voxel_mask = patchmask_to_voxelmask(mask, patch_size=mae.patch_size,
+                                    volume_size=mae.volume_size)
+    err_base[~voxel_mask] = 0
+    err_sae [~voxel_mask] = 0
+
+    z = vols.size(2) // 2                     # mid-slice
+    fig, ax = plt.subplots(1, 4, figsize=(16,4))
+
+    ax[0].imshow(vols[0,0,z].float().cpu().numpy(),        cmap='gray'); ax[0].set_title('GT');             ax[0].axis('off')
+    ax[1].imshow(base_rec[0,0,z].float().cpu().numpy(),    cmap='gray'); ax[1].set_title('MAE');            ax[1].axis('off')
+    ax[2].imshow(sae_rec_vol[0,0,z].float().cpu().numpy(), cmap='gray'); ax[2].set_title('SAE-patched');    ax[2].axis('off')
+    delta = (err_base - err_sae)[0,0,z].float().cpu()
+    vmax  = delta.abs().max()
+    ax[3].imshow(delta, cmap='bwr', vmin=-vmax, vmax=vmax)
+    ax[3].set_title('error Δ\n(blue = better)');         ax[3].axis('off')
+    # fig.tight_layout()
+    return fig
+
+import math 
+
+# add once near the other imports
+import math   # needed for ceil() and divmod()
+
+# ----------------------------------------------------------------------
+def visualize_sae_slice_grid(
+    mae, sae, vols, token_extractor,
+    layer_idx,
+    step, tag="sae_slice_grid",
+    out_dir="vis", mask_ratio=0.85,
+):
+    """
+    One figure showing, for every volume in `vols`:
+        ┌───────── sample 0 ─────────┬──────── sample 1 ────────┬ … ┐
+        │  GT | MAE | SAE            │  GT | MAE | SAE          │   │  ← Z‑row
+        │  GT | MAE | SAE            │  GT | MAE | SAE          │   │  ← Y‑row
+        │  GT | MAE | SAE            │  GT | MAE | SAE          │   │  ← X‑row
+        └────────────────────────────┴──────────────────────────┴ … ┘
+    A block of 3×3 images is placed for every sample; blocks are tiled
+    on an R × C grid (e.g. 2 × 3 when `vis_samples==6`).
+    """
+    device = vols.device
+    B      = vols.size(0)
+    dtype  = next(mae.parameters()).dtype            # bf16 / fp16 / fp32
+
+    # ── 1 · MAE truth‑masked reconstruction (baseline) ──────────────
+    base_rec, mask = ActivationInjector._reconstruct_with_mask(
+        mae, vols, mask_ratio
+    )
+    base_rec = base_rec.to(dtype=dtype)
+
+    # ── 2 · SAE‑patched reconstruction on the *same* mask pattern ──
+    toks = token_extractor.extract_tokens(vols)                   # (B·L, C)
+    # toks_wh = (toks - act_mean) / act_std                         # whiten
+
+    if isinstance(sae, GatedSAE):
+        sae_recon, _, _ = sae(toks)                            # (B·L, C)
+    else:
+        sae_recon, _ = sae(toks)
+
+    sae_tok = sae_recon    
+
+    # sae_tok = sae_recon * act_std + act_mean                      # un‑whiten
+
+    inj = ActivationInjector(mae, layer_idx)
+    inj.set_replacement_activations(sae_tok.to(dtype=dtype))
+    sae_rec, _ = ActivationInjector._reconstruct_with_mask(
+        mae, vols, mask_ratio, injector=inj
+    )
+    sae_rec = sae_rec.to(dtype=dtype)
+
+    # ── 3 · move to CPU / fp32 for Matplotlib ───────────────────────
+    vols_cpu = vols.float().cpu()
+    base_cpu = base_rec.float().cpu()
+    sae_cpu  = sae_rec.float().cpu()
+
+    D, H, W  = vols_cpu.shape[-3:]
+    z, y, x  = D // 2, H // 2, W // 2
+
+    # ── 4 · decide sample‑grid layout (≤3 cols/row) ────────────────
+    grid_cols = min(3, B)
+    grid_rows = math.ceil(B / grid_cols)
+
+    fig_rows  = 3 * grid_rows               # 3 slice‑rows per sample
+    fig_cols  = 3 * grid_cols               # GT | MAE | SAE
+
+    fig, ax = plt.subplots(
+        fig_rows,
+        fig_cols,
+        figsize=(2.4 * fig_cols, 2.4 * grid_rows),   # generous cell size
+        gridspec_kw={"wspace": 0.01, "hspace": 0.01}
+    )
+
+    for s in range(B):
+        rb, cb = divmod(s, grid_cols)       # sample‑block row / col
+        r_off  = rb * 3                     # top row of this block
+        c_off  = cb * 3                     # left col of this block
+
+        tiles = [
+            (vols_cpu[s, 0,  z],     f"#{s+1} Z"),   (base_cpu[s, 0,  z], "MAE"),   (sae_cpu[s, 0,  z], "SAE"),
+            (vols_cpu[s, 0, :, y, :], ""),           (base_cpu[s, 0, :, y, :], ""), (sae_cpu[s, 0, :, y, :], ""),
+            (vols_cpu[s, 0, :, :, x], ""),           (base_cpu[s, 0, :, :, x], ""), (sae_cpu[s, 0, :, :, x], ""),
+        ]
+        for k, (img, title) in enumerate(tiles):
+            r = r_off + k // 3
+            c = c_off + k % 3
+            ax[r, c].imshow(img, cmap="gray")
+            if title:
+                ax[r, c].set_title(title, fontsize=7)
+            ax[r, c].axis("off")
+
+    fig.suptitle(f"{tag} – step {step}", fontsize=14)
+    # manual padding ≪ tight_layout (avoids large white margins)
+    fig.subplots_adjust(left=0.01, right=0.99, top=0.94, bottom=0.04,
+                        wspace=0.01, hspace=0.01)
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(exist_ok=True)
+    fn = out_dir / f"{tag}_step_{step}.png"
+    fig.savefig(fn, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    return [fn]
+
+
+def patchmask_to_voxelmask(mask, patch_size=(8, 8, 8),
+                           volume_size=(96, 96, 96)):
+    """
+    mask : (B, L)      patch‑level mask from MAE
+    returns (B, 1, D, H, W) voxel‑wise boolean mask
+    """
+    B, L = mask.shape
+    pd, ph, pw = [volume_size[i] // patch_size[i] for i in range(3)]
+
+    # ---- reshape to grid & convert to *bool* right away -------------
+    mask_3d = mask.view(B, pd, ph, pw).bool()        # (B, 12, 12, 12)
+
+    # ---- nearest‑neighbour up‑sampling to voxel resolution ----------
+    mask_3d = mask_3d.repeat_interleave(patch_size[0], 1)   # D
+    mask_3d = mask_3d.repeat_interleave(patch_size[1], 2)   # H
+    mask_3d = mask_3d.repeat_interleave(patch_size[2], 3)   # W
+
+    return mask_3d.unsqueeze(1)            # (B, 1, D, H, W)   *bool* 
 
 # ═════════════════════════ training loop ═══════════════════════════════
 def train_sae(args):
@@ -443,9 +949,9 @@ def train_sae(args):
     
     # Validation loader (smaller, for periodic evaluation)
     val_dataset = TarShardDataset(val_shards, args.img_size, shuffle=False)
-    val_loader = DataLoader(
+    val_loader  = DataLoader(
         val_dataset,
-        batch_size=args.batch_size // 2,  # Smaller batches for validation
+        batch_size=args.batch_size // 2,      # lighter on memory
         num_workers=args.num_workers // 2,
         pin_memory=False,
         drop_last=False,
@@ -455,6 +961,15 @@ def train_sae(args):
         timeout=300
     )
 
+    # Visualization loader (for periodic SAE reconstruction comparisons)
+    vis_loader = DataLoader(
+        TarShardDataset(val_shards[:1], args.img_size, shuffle=False),
+        batch_size=args.vis_samples,          # full mini‑batch for grids
+        num_workers=0,
+        pin_memory=False,
+        drop_last=False
+    )
+
     # ─── MAE backbone (frozen) ─────────────────────────────────────
     archs = {
         "small": mae_vit_3d_small_conv,
@@ -462,6 +977,7 @@ def train_sae(args):
         "base_conv": mae_vit_3d_base_conv,
         "large": mae_vit_3d_large_conv,
         "hemibrain_optimal": mae_vit_3d_hemibrain_optimal_conv,
+        "base_patch_conv": mae_vit_3d_base_patch_conv,
     }
     mae = archs[args.model_arch](
         volume_size=(args.img_size,) * 3,
@@ -473,28 +989,50 @@ def train_sae(args):
     for p in mae.parameters():
         p.requires_grad = False
 
-    # Load checkpoint BEFORE compilation to avoid prefix issues
-    if args.checkpoint:
-        ckpt = torch.load(args.checkpoint, map_location="cpu")
-        state_dict = ckpt["model_state_dict"]
-        
-        # Remove _orig_mod. prefix from torch.compile compiled models
-        clean_state_dict = {}
-        for key, value in state_dict.items():
-            if key.startswith('_orig_mod.'):
-                clean_key = key[len('_orig_mod.'):]
-                clean_state_dict[clean_key] = value
-            else:
-                clean_state_dict[key] = value
-        
-        missing = mae.load_state_dict(clean_state_dict, strict=False)
-        print(f"Loaded MAE checkpoint - Missing keys: {len(missing.missing_keys)}, Unexpected keys: {len(missing.unexpected_keys)}")
-        if missing.missing_keys:
-            print(f"Missing keys (first 5): {missing.missing_keys[:5]}")
-        if missing.unexpected_keys:
-            print(f"Unexpected keys (first 5): {missing.unexpected_keys[:5]}")
+    # Determine autocast dtype first
+    autocast_dtype = _AMP_DTYPE_MAP.get(args.amp_dtype, torch.bfloat16)
 
-    # Compile MAE for faster inference AFTER loading checkpoint
+    # Load checkpoint with proper dtype handling
+    if args.checkpoint:
+        try:
+            # Try using the load_model_checkpoint function which handles dtype metadata
+            mae, checkpoint = load_model_checkpoint(args.checkpoint, mae, device=device)
+            print(f"Loaded MAE checkpoint using load_model_checkpoint")
+        except Exception as e:
+            print(f"Error with load_model_checkpoint, falling back to manual loading: {e}")
+            # Fallback to manual loading (original approach)
+            ckpt = torch.load(args.checkpoint, map_location="cpu")
+            state_dict = ckpt["model_state_dict"]
+            
+            # Remove _orig_mod. prefix from torch.compile compiled models
+            clean_state_dict = {}
+            for key, value in state_dict.items():
+                if key.startswith('_orig_mod.'):
+                    clean_key = key[len('_orig_mod.'):]
+                    clean_state_dict[clean_key] = value
+                else:
+                    clean_state_dict[key] = value
+            
+            missing = mae.load_state_dict(clean_state_dict, strict=False)
+            print(f"Loaded MAE checkpoint - Missing keys: {len(missing.missing_keys)}, Unexpected keys: {len(missing.unexpected_keys)}")
+            if missing.missing_keys:
+                print(f"Missing keys (first 5): {missing.missing_keys[:5]}")
+            if missing.unexpected_keys:
+                print(f"Unexpected keys (first 5): {missing.unexpected_keys[:5]}")
+    
+    # Ensure model dtype matches autocast dtype (fallback for consistency)
+    if args.use_amp:
+        current_dtype = next(mae.parameters()).dtype
+        if current_dtype != autocast_dtype:
+            mae = mae.to(dtype=autocast_dtype, device=device)
+            print(f"Converted MAE model from {current_dtype} to {autocast_dtype} for autocast consistency")
+        else:
+            print(f"MAE model already in correct dtype: {autocast_dtype}")
+    else:
+        # Ensure model is on correct device even if not using AMP
+        mae = mae.to(device)
+
+    # Compile MAE for faster inference AFTER loading checkpoint and dtype conversion
     if args.compile_mae:
         mae = torch.compile(mae, backend="inductor", mode="default")
         print("MAE backbone compiled with torch.compile")
@@ -509,22 +1047,20 @@ def train_sae(args):
         print(f"Token extractor created for encoder layer {args.layer}")
     
     # Determine token dimension C from model
-    dummy = torch.zeros(1, 1, args.img_size, args.img_size, args.img_size)
+    # Create dummy tensor with same dtype as model to avoid dtype mismatch
+    model_dtype = next(mae.parameters()).dtype
+    dummy = torch.zeros(1, 1, args.img_size, args.img_size, args.img_size, dtype=model_dtype)
     C = token_extractor.extract_tokens(dummy.to(device)).shape[1]
     print(f"Token feature dimension: {C}")
 
     latent_dim = args.latent_dim or C * args.latent_dim_multiplier
     print(f"Latent dim: {latent_dim}")
 
-    # ─── Activation whitening (compute once) ──────────────────────────────
-    print("Computing activation mean/std for whitening …")
-    with torch.no_grad():
-        samp_prefetch = CUDAPrefetcher(loader, device)
-        samp_vols = next(iter(samp_prefetch))
-        samp_tok = token_extractor.extract_tokens(samp_vols)
-        act_mean = samp_tok.mean(0, keepdim=True)  # (1, C)
-        act_std  = samp_tok.std(0, keepdim=True).clamp_(min=1e-6)
-    print("Whitening stats ready → mean/std vectors shape", act_mean.shape)
+    # ─── Activation whitening (DISABLED by user) ──────────────────────────
+    # print("Activation whitening DISABLED by user request.")
+    # act_mean = torch.zeros(1, C, device=device, dtype=autocast_dtype)
+    # act_std  = torch.ones(1, C, device=device, dtype=autocast_dtype)
+    # print("Whitening stats set to no-op (mean=0, std=1).")
 
     if args.sae_variant=="linear":
         sae = LinearSAE(C, latent_dim, activation=args.activation, k_sparse=args.k_sparse).to(device)
@@ -532,6 +1068,9 @@ def train_sae(args):
         sae = GatedSAE(C, latent_dim, k_sparse=args.k_sparse).to(device)
     else:
         raise ValueError("unknown sae_variant")
+    
+    sae = sae.to(device=device, dtype=autocast_dtype)
+    # sae = sae.to(device=device)
     
     # Debug: print parameter shapes
     if args.sae_variant=="linear":
@@ -553,7 +1092,7 @@ def train_sae(args):
     
     # Debug: test forward pass with dummy data
     with torch.no_grad():
-        dummy_tokens = torch.randn(10, C, device=device)  # 10 tokens, C dimensions
+        dummy_tokens = torch.randn(10, C, device=device, dtype=autocast_dtype)  # 10 tokens, C dimensions
         if args.sae_variant=="gated":
             dummy_recon, dummy_f, _ = sae(dummy_tokens)
         else:
@@ -624,8 +1163,7 @@ def train_sae(args):
     else:
         scheduler = None
     
-    # Determine autocast dtype (bf16 recommended for H100)
-    autocast_dtype = _AMP_DTYPE_MAP.get(args.amp_dtype, torch.bfloat16)
+    # autocast_dtype already determined above during MAE model setup
     
     # GradScaler only needed for fp16, not bf16
     if args.use_amp and args.amp_dtype == "fp16":
@@ -653,7 +1191,7 @@ def train_sae(args):
         # Create checkpoints directory
         checkpoint_dir = Path("checkpoints")
         checkpoint_dir.mkdir(exist_ok=True)
-        best_model_path = checkpoint_dir / f"best_sae_{args.run_name}.pt"
+        best_model_path = checkpoint_dir / f"{args.run_name}.pt"
 
     global_step, samples = 0, 0
     loss_ma = deque(maxlen=100)
@@ -674,6 +1212,7 @@ def train_sae(args):
         vols_iter = iter(pbar)
         try:
             current_vols = next(vols_iter)
+            current_vols = current_vols.to(dtype=model_dtype)
         except StopIteration:
             continue
             
@@ -681,6 +1220,7 @@ def train_sae(args):
             current_tokens = token_extractor.extract_tokens(current_vols)
         
         for next_vols in vols_iter:
+            next_vols = next_vols.to(dtype=model_dtype)
             if cancel["stop"] or global_step >= total_steps_budget:
                 break
             global_step += 1
@@ -698,18 +1238,28 @@ def train_sae(args):
             optim.zero_grad(set_to_none=True)
             
             with torch.cuda.amp.autocast(enabled=args.use_amp, dtype=autocast_dtype):
-                # Whitening
-                tokens_wh = (tokens - act_mean) / act_std
-                if args.sae_variant=="gated":
-                    recon, z, gate = sae(tokens_wh)
+                if isinstance(sae, GatedSAE):
+                    recon, z, gate = sae(tokens)
                 else:
-                    recon, z = sae(tokens_wh)
-                mse = F.mse_loss(recon, tokens_wh)
-                if args.sae_variant=="gated":
+                    recon, z = sae(tokens)
+                mse = F.mse_loss(recon, tokens)
+
+                # ── orthogonality penalty on decoder rows ─────────────
+                if args.ortho_coeff > 0.0:
+                    W     = sae.decoder_weight             # (latent, input_dim)
+                    gram  = W @ W.T                        # (latent, latent)
+                    eye   = torch.eye(gram.size(0), device=W.device, dtype=W.dtype)
+                    ortho = ((gram - eye) ** 2).sum() / (W.shape[0] ** 2)   # scale‑invariant
+                else:
+                    ortho = torch.tensor(0.0, device=mse.device, dtype=mse.dtype)
+                # ────────────────────────────────────────────────────────────
+
+                if args.sae_variant == "gated":
                     gate_l1 = gate.abs().sum(dim=1).mean()
-                    loss = mse + current_l1*gate_l1
+                    loss = mse + current_l1 * gate_l1 + args.ortho_coeff * ortho
                 else:
-                    loss = mse
+                    l1_penalty = z.abs().sum(dim=1).mean()
+                    loss = mse + current_l1 * l1_penalty + args.ortho_coeff * ortho
 
             # Fail fast if loss is NaN or Inf
             if not torch.isfinite(loss):
@@ -717,13 +1267,12 @@ def train_sae(args):
 
             # Store high-loss tokens for dead latent resampling
             with torch.no_grad():
-                detached_tokens_wh = tokens_wh.detach()
-                token_losses = F.mse_loss(recon.detach(), detached_tokens_wh, reduction='none').mean(dim=1)
+                token_losses = F.mse_loss(recon.detach(), tokens.detach(), reduction='none').mean(dim=1)
                 # Get top 10% highest loss tokens
                 if len(token_losses) > 10:
                     k = max(1, len(token_losses) // 10)
                     high_loss_indices = torch.topk(token_losses, k).indices
-                    high_loss_tokens = detached_tokens_wh[high_loss_indices].cpu()
+                    high_loss_tokens = tokens[high_loss_indices].cpu()
                     high_loss_buffer.extend(high_loss_tokens)
 
             # Backward pass and optimization step
@@ -768,7 +1317,7 @@ def train_sae(args):
             # Post-optimization steps (Anthropic-style)
             with torch.no_grad():
                 # 1. Normalize decoder weights (sparse dictionary learning)
-                sae.normalize_decoder_weights_proper()
+                # sae.normalize_decoder_weights_proper()
                 
                 # 2. Update dead latent tracking
                 sae.update_dead_latent_stats(z.detach())
@@ -811,6 +1360,13 @@ def train_sae(args):
                 frac_active = frac_active_step
                 l1_val = z.detach().abs().sum(dim=1).mean() # Still compute for logging
                 
+                # Log token stats
+                with torch.no_grad():
+                    metrics["token_mean"] = tokens.mean().item()
+                    metrics["token_std"] = tokens.std().item()
+                    metrics["token_min"] = tokens.min().item()
+                    metrics["token_max"] = tokens.max().item()
+                
                 # For gated SAE, log separate gate and magnitude sparsity
                 if args.sae_variant=="gated":
                     gate_sparsity = float((gate.detach() == 0).float().mean())
@@ -818,12 +1374,14 @@ def train_sae(args):
                     metrics.update({
                         "gate_sparsity": gate_sparsity,
                         "mag_sparsity": mag_sparsity,
+                        "ortho": float(ortho.detach()),
                     })
                 
                 metrics.update({
                     "train_loss": sum(loss_ma) / len(loss_ma) if loss_ma else 0.0,
                     "train_mse": float(mse.detach()),
                     "train_l1": float(l1_val), # Log the L1 value even if not in loss
+                    "train_ortho": float(ortho.detach()),
                     "train_sparsity": sparsity,
                     "train_frac_active": frac_active,
                     "learning_rate": optim.param_groups[0]['lr'],
@@ -859,7 +1417,7 @@ def train_sae(args):
                 metrics["current_l1"] = current_l1
 
             if global_step % args.val_interval == 0:
-                val_metrics = run_sae_validation(sae, mae, val_loader, args.layer, device, act_mean, act_std, token_extractor)
+                val_metrics = run_sae_validation(sae, mae, val_loader, args.layer, device, token_extractor, extract_from=args.extract_from, sae_variant=args.sae_variant)
                 metrics.update(val_metrics)
                 
                 # Light cleanup without blocking (like vol_train.py)
@@ -889,6 +1447,38 @@ def train_sae(args):
                     # Also log to wandb that we saved a new best model
                     metrics["best_val_mse"] = best_val_mse
                     metrics["saved_best_model"] = True
+
+            # SAE visualization (like vis_interval in vol_train.py)
+            if args.vis_interval and global_step % args.vis_interval == 0:
+                with torch.no_grad():
+                    # take one mini‑batch from the vis_loader
+                    try:
+                        vis_vols = next(iter(vis_loader))
+                    except StopIteration:
+                        vis_vols = next(iter(DataLoader(
+                            TarShardDataset(val_shards[:1], args.img_size, shuffle=False),
+                            batch_size=args.vis_samples)))
+                    vis_vols = vis_vols.to(device, dtype=model_dtype)
+
+                    # run full SAE‑patched reconstruction just once
+                    recon_data = compute_reconstruction_mse_with_sae(
+                        mae, vis_vols, args.layer, sae,
+                        device, token_extractor, extract_from=args.extract_from,
+                        mask_ratio=0.85
+                    )
+
+                    # grid of SAE‑patched outputs
+                    grid_pngs = visualize_sae_slice_grid(
+                        mae, sae, vis_vols, token_extractor,
+                        layer_idx=args.layer,
+                        step=global_step
+                    )
+                    for p in grid_pngs:
+                        wandb.log({"sae_slice_grid": wandb.Image(str(p))},
+                                  step=global_step, commit=False)
+
+                wandb.log({}, step=global_step, commit=True)   # flush
+
                     
             # Log dead latent statistics periodically
             if global_step % args.val_interval == 0:
@@ -928,17 +1518,17 @@ def train_sae(args):
             optim.zero_grad(set_to_none=True)
             
             with torch.cuda.amp.autocast(enabled=args.use_amp, dtype=autocast_dtype):
-                tokens_wh = (tokens - act_mean) / act_std
-                if args.sae_variant=="gated":
-                    recon, z, gate = sae(tokens_wh)
+                if isinstance(sae, GatedSAE):
+                    recon, z, gate = sae(tokens)
                 else:
-                    recon, z = sae(tokens_wh)
-                mse = F.mse_loss(recon, tokens_wh)
-                if args.sae_variant=="gated":
+                    recon, z = sae(tokens)
+                mse = F.mse_loss(recon, tokens)
+                if isinstance(sae, GatedSAE):
                     gate_l1 = gate.abs().sum(dim=1).mean()
                     loss = mse + current_l1*gate_l1
                 else:
-                    loss = mse
+                    l1_penalty = z.abs().sum(dim=1).mean()
+                    loss = mse + current_l1 * l1_penalty
 
             if not torch.isfinite(loss):
                 raise RuntimeError(f"Non-finite loss detected at step {global_step}: {loss.item()}")
@@ -980,7 +1570,7 @@ def train_sae(args):
 
             # Post-optimization steps
             with torch.no_grad():
-                sae.normalize_decoder_weights_proper()
+                # sae.normalize_decoder_weights_proper()
                 sae.update_dead_latent_stats(z.detach())
 
             loss_ma.append(float(loss.detach()))
@@ -1020,7 +1610,7 @@ if __name__ == "__main__":
     # Data / MAE model
     P.add_argument("--shard_dir", required=True, help="Directory with shard_XXXXX.tar files")
     P.add_argument("--checkpoint", required=True, help="Pre-trained MAE checkpoint (.pt)")
-    P.add_argument("--model_arch", default="base", choices=["small", "base", "large", "base_conv", "hemibrain_optimal"],
+    P.add_argument("--model_arch", default="base", choices=["small", "base", "large", "base_conv", "hemibrain_optimal", "base_patch_conv"],
                    help="Which MAE architecture to instantiate (must match checkpoint)")
     # EMA config reuse – needed for kwargs
     P.add_argument("--img_size", type=int, default=96)
@@ -1035,6 +1625,8 @@ if __name__ == "__main__":
     P.add_argument("--latent_dim_multiplier", type=int, default=3,
                    help="If --latent_dim not set, use multiplier × input_dim (default 3×)")
     P.add_argument("--l1_coeff", type=float, default=8e-3, help="Fixed L1 coefficient for sparsity (following Anthropic's approach)")
+    P.add_argument("--ortho_coeff", type=float, default=1e-3, help="weight for decoder orthogonality penalty (0→ disables)")
+
     P.add_argument("--l1_tune_interval", type=int, default=500, help="Steps between auto-tuning L1 coeff")
     P.add_argument("--dead_threshold", type=int, default=20000, help="Steps before a latent is considered dead")
     P.add_argument("--resample_interval", type=int, default=25000, help="Steps between dead latent resampling")
@@ -1089,6 +1681,8 @@ if __name__ == "__main__":
     # argparse additions
     P.add_argument("--total_steps", type=int, default=None, help="Total optimiser steps to run (overrides --epochs)")
     P.add_argument("--sae_variant", choices=["linear","gated"], default="linear", help="SAE architecture to use")
+    P.add_argument("--vis_interval", type=int, default=500, help="Steps between SAE reconstruction visualizations")
+    P.add_argument("--vis_samples", type=int, default=3, help="Number of samples to visualize for each reconstruction")
 
     args = P.parse_args()
     train_sae(args) 

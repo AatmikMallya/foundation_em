@@ -10,142 +10,109 @@ class MAEArchitecture(Scene):
         # Title
         title = Text("MAE 3D Base-Conv Architecture", font_size=36, color=WHITE)
         title.to_edge(UP, buff=0.5)
-        self.add(title) # Explicitly add title to the scene for persistence
-        self.play(FadeIn(title), run_time=1.5) # Fade in instead of Write
+        self.play(Write(title), run_time=1.5)
         self.wait(0.5)
         
-        # --- Define all static stage objects (initially invisible) ---
-        input_pos = LEFT * 5.5 + DOWN * 0.5
-        patch_pos = LEFT * 2.8 + DOWN * 0.5
-        mask_pos = LEFT * 0.3 + DOWN * 0.5
-        flatten_base = mask_pos + RIGHT * 1.2
-        encoder_pos = RIGHT * 0.5 + DOWN * 0.5
-
-        # 1. Input Cube (static base)
-        input_cube_static = Cube(side_length=0.8, fill_opacity=0.3, fill_color=BLUE, stroke_color=WHITE, stroke_width=3)
-        input_cube_static.rotate(PI/6, axis=UP).rotate(PI/8, axis=RIGHT)
-        input_cube_static.move_to(input_pos)
-        input_cube_static.set_opacity(0) # Initially invisible
-        input_label = Text("Input\n96³", font_size=18, color=WHITE)
-        input_label.next_to(input_cube_static, DOWN, buff=0.3)
-        input_label.set_opacity(0) # Initially invisible
-
-        # 2. Patches at Patchify Stage (static base)
-        original_side_length = 0.8
-        visible_cubes_per_side = 4
-        mini_cube_side = original_side_length / visible_cubes_per_side
-        final_gap = 0.05
-        final_spacing = mini_cube_side + final_gap
-        
-        patches_at_patch_pos_static = VGroup()
-        for i in range(visible_cubes_per_side):
-            for j in range(visible_cubes_per_side):
-                for k in range(visible_cubes_per_side):
-                    c = Cube(side_length=mini_cube_side, fill_opacity=0.7, fill_color=BLUE, stroke_width=0.2, stroke_color=WHITE)
-                    offset_x = (i - (visible_cubes_per_side - 1) / 2) * final_spacing
-                    offset_y = (j - (visible_cubes_per_side - 1) / 2) * final_spacing
-                    offset_z = (k - (visible_cubes_per_side - 1) / 2) * final_spacing
-                    c.move_to(np.array([offset_x, offset_y, offset_z]))
-                    patches_at_patch_pos_static.add(c)
-        patches_at_patch_pos_static.rotate(PI/6, axis=UP).rotate(PI/8, axis=RIGHT)
-        patches_at_patch_pos_static.move_to(patch_pos)
-        patches_at_patch_pos_static.set_opacity(0) # Initially invisible
-
-        patch_label = Text("Patchify\n4³=64\npatches", font_size=16, color=WHITE)
-        patch_label.next_to(patches_at_patch_pos_static, DOWN, buff=0.3)
-        patch_label.set_opacity(0) # Initially invisible
-
-        # 3. Masked Patches at Masking Stage (static base)
-        masked_at_mask_pos_static = patches_at_patch_pos_static.copy() # Start from patches appearance
-        masked_at_mask_pos_static.move_to(mask_pos)
-        masked_at_mask_pos_static.set_opacity(0) # Initially invisible
-        
-        # Color 75% of this static group red for masking effect
-        total_patches_in_group = len(masked_at_mask_pos_static)
-        num_masked = int(total_patches_in_group * 0.75)
-        masked_indices = random.sample(range(total_patches_in_group), num_masked)
-        for idx in masked_indices:
-            masked_at_mask_pos_static[idx].set_fill(RED) # Directly set color for static copy
-
-        mask_label = Text("Masking\n75% masked", font_size=16, color=WHITE)
-        mask_label.next_to(masked_at_mask_pos_static, DOWN, buff=0.3)
-        mask_label.set_opacity(0) # Initially invisible
-
-        # 4. Flattened Patches (static base)
-        flattened_patches_static = VGroup()
-        vertical_spacing = mini_cube_side * 0.9
-        for idx in range(total_patches_in_group):
-            c = patches_at_patch_pos_static[idx].copy() # Base copy from original patches for shape
-            c.move_to(flatten_base + UP * ((idx - (total_patches_in_group - 1) / 2) * vertical_spacing))
-            flattened_patches_static.add(c)
-        flattened_patches_static.rotate(PI/2, axis=OUT) # Flatten visually
-        flattened_patches_static.set_opacity(0) # Initially invisible
-
-        # --- Setup the scene flow --- (use these static objects for animation targets)
-        self.add(input_cube_static, input_label) # Add input static to scene initially
-        self.add(patches_at_patch_pos_static, patch_label) # Add static patches
-        self.add(masked_at_mask_pos_static, mask_label) # Add static masked patches
-        self.add(flattened_patches_static) # Add static flattened patches
-
+        # Create main flow line
         flow_line = Line(LEFT * 6, RIGHT * 6, color=GRAY_A, stroke_width=2)
         flow_line.shift(DOWN * 0.5)
         self.play(Create(flow_line), run_time=1)
         
-        # Stage 1: Input Volume - Reveal
-        self.play(input_cube_static.animate.set_opacity(1), input_label.animate.set_opacity(1), run_time=1)
+        # --- Define positions ---
+        input_pos = LEFT * 5.5 + DOWN * 0.5
+        patch_pos = LEFT * 2.8 + DOWN * 0.5
+        mask_pos = LEFT * 0.3 + DOWN * 0.5
+        
+        # --- Stage 1: Input Cube ---
+        input_cube = Cube(side_length=0.8, fill_opacity=0.3, fill_color=BLUE, stroke_color=WHITE, stroke_width=2)
+        input_cube.rotate(PI/6, axis=UP).rotate(PI/8, axis=RIGHT)
+        input_cube.move_to(input_pos)
+        input_label = Text("Input\n96³", font_size=18, color=WHITE)
+        input_label.next_to(input_cube, DOWN, buff=0.3)
+        self.play(FadeIn(input_cube), Write(input_label), run_time=1)
         self.wait(0.5)
-        
-        # Stage 2: Patchify - Animate input_cube transforming into patches_at_patch_pos
-        # Create a temporary animated copy of input_cube
-        animated_input_to_patches = input_cube_static.copy() # Removed .set_opacity(1)
-        
-        arrow1 = Arrow(input_cube_static.get_boundary_point(RIGHT), patches_at_patch_pos_static.get_boundary_point(LEFT), buff=0.1, color=WHITE, stroke_width=3)
 
-        self.play(GrowArrow(arrow1), run_time=0.8) # Grow arrow first
+        # --- Stage 2: Patchify ---
+        cubes_per_side = 4
+        mini_cube_side = 0.8 / cubes_per_side
 
+        # 2a. Create the subdivided cube (gapless) that will replace the input cube
+        subdivision_group = VGroup()
+        for i in range(cubes_per_side):
+            for j in range(cubes_per_side):
+                for k in range(cubes_per_side):
+                    c = Cube(side_length=mini_cube_side, fill_opacity=0.7, fill_color=BLUE, stroke_width=0.5, stroke_color=WHITE)
+                    offset_x = (i - (cubes_per_side - 1) / 2) * mini_cube_side
+                    offset_y = (j - (cubes_per_side - 1) / 2) * mini_cube_side
+                    offset_z = (k - (cubes_per_side - 1) / 2) * mini_cube_side
+                    c.move_to(np.array([offset_x, offset_y, offset_z]))
+                    subdivision_group.add(c)
+        
+        # Rotate the entire group at once to look like one object
+        subdivision_group.rotate(PI/6, axis=UP).rotate(PI/8, axis=RIGHT)
+        subdivision_group.move_to(input_pos)
+
+        # 2b. Create the final patch grid (with gaps)
+        gap = 0.05
+        spacing = mini_cube_side + gap
+        patches_group = VGroup()
+        for i in range(cubes_per_side):
+            for j in range(cubes_per_side):
+                for k in range(cubes_per_side):
+                    c = Cube(side_length=mini_cube_side, fill_opacity=0.7, fill_color=BLUE, stroke_width=0.5, stroke_color=WHITE)
+                    offset_x = (i - (cubes_per_side - 1) / 2) * spacing
+                    offset_y = (j - (cubes_per_side - 1) / 2) * spacing
+                    offset_z = (k - (cubes_per_side - 1) / 2) * spacing
+                    c.move_to(np.array([offset_x, offset_y, offset_z]))
+                    patches_group.add(c)
+        
+        # Apply the same rotation to the final group
+        patches_group.rotate(PI/6, axis=UP).rotate(PI/8, axis=RIGHT)
+        patches_group.move_to(patch_pos)
+        
+        patch_label = Text("Patchify\n4³=64 patches", font_size=16, color=WHITE)
+        patch_label.next_to(patches_group, DOWN, buff=0.3)
+        arrow1 = Arrow(input_cube.get_right(), patches_group.get_left(), buff=0.4, color=WHITE, stroke_width=3)
+        
+        # Animate the subdivision and move
+        self.play(GrowArrow(arrow1))
         self.play(
-            Write(patch_label.set_opacity(1)), # Write label to make it visible
-            ReplacementTransform(animated_input_to_patches, patches_at_patch_pos_static), # Transform into static patches
-            run_time=2.0
+            ReplacementTransform(input_cube, subdivision_group),
+            Write(patch_label),
+            run_time=1.5
         )
-        self.wait(0.5)
-
-        # Stage 3: Masking - Animate patches_at_patch_pos moving and getting masked
-        # Create a temporary animated copy of patches_at_patch_pos
-        animated_patches_to_mask = patches_at_patch_pos_static.copy() # Removed .set_opacity(1)
-        # Removed: self.add(animated_patches_to_mask) here. It will be added by the play().
-        
-        arrow2 = Arrow(patches_at_patch_pos_static.get_boundary_point(RIGHT), masked_at_mask_pos_static.get_boundary_point(LEFT), buff=0.1, color=WHITE, stroke_width=3)
-
-        self.play(GrowArrow(arrow2), run_time=0.8) # Grow arrow first
-
-        self.play(animated_patches_to_mask.animate.move_to(mask_pos), run_time=1.5) # Then move
-        self.wait(0.2)
-
-        # Now, animate the actual masking effect (color change) on the moved copy
-        # Then replace the animated copy with the static masked version to ensure persistence
         self.play(
-            *[animated_patches_to_mask[idx].animate.set_fill(RED) for idx in masked_indices],
-            Write(mask_label.set_opacity(1)), # Write label to make it visible
-            ReplacementTransform(animated_patches_to_mask, masked_at_mask_pos_static), # Make static masked cube persistent
+            Transform(subdivision_group, patches_group),
             run_time=1.5
         )
         self.wait(0.5)
 
-        # Stage 4: Flattening - Animate masked_patches_to_mask becoming flattened
-        # Create a temporary animated copy of the masked patches
-        animated_patches_to_flatten = masked_at_mask_pos_static.copy() # Removed .set_opacity(1)
-        # Removed: self.add(animated_patches_to_flatten) here.
+        # --- Stage 3: Masking ---
+        # Animate cubes moving to masking position
+        self.play(subdivision_group.animate.move_to(mask_pos), run_time=1.5)
+
+        # Apply masking (color change) after moving
+        total_patches = len(subdivision_group)
+        num_masked = int(total_patches * 0.75)
+        masked_indices = random.sample(range(total_patches), num_masked)
+        mask_label = Text("Masking\n75% masked", font_size=16, color=WHITE)
+        mask_label.next_to(subdivision_group, DOWN, buff=0.3)
         
-        arrow3 = Arrow(masked_at_mask_pos_static.get_boundary_point(RIGHT), flattened_patches_static.get_boundary_point(LEFT), buff=0.1, color=WHITE, stroke_width=3)
-        self.play(GrowArrow(arrow3), run_time=0.8) # Grow arrow first
+        arrow2 = Arrow(patch_pos + RIGHT*0.4, mask_pos + LEFT*0.4, buff=0.1, color=WHITE, stroke_width=3)
+        self.play(GrowArrow(arrow2))
         self.play(
-            Transform(animated_patches_to_flatten, flattened_patches_static), # Transform into flattened static
-            run_time=2.0
+            *[subdivision_group[idx].animate.set_fill(RED) for idx in masked_indices],
+            Write(mask_label),
+            run_time=1.5
         )
-        self.wait(0.3)
+        self.wait(0.5)
         
-        # --- Encoder Stage ---
+        # --- Final cleanup and rest of the animation ---
+        # ... (rest of the script can follow) ...
+        self.wait(2)
+        
+        # Stage 4: Encoder
+        encoder_pos = RIGHT * 0.5 + DOWN * 0.5
         encoder_rect = RoundedRectangle(
             width=1.2, height=1.5, corner_radius=0.1,
             fill_opacity=0.8, fill_color=ORANGE, stroke_color=ORANGE
@@ -157,10 +124,10 @@ class MAEArchitecture(Scene):
         encoder_title = Text("Encoder", font_size=20, color=ORANGE)
         encoder_title.next_to(encoder_rect, DOWN, buff=0.3)
         
-        arrow_to_encoder = Arrow(flattened_patches_static.get_boundary_point(RIGHT), encoder_rect.get_boundary_point(LEFT), buff=0.1, color=WHITE, stroke_width=3)
-
-        self.play(GrowArrow(arrow_to_encoder), run_time=0.8) # Grow arrow first
+        arrow3 = Arrow(mask_pos + RIGHT*0.3, encoder_pos + LEFT*0.6, buff=0.1, color=WHITE, stroke_width=3)
+        
         self.play(
+            GrowArrow(arrow3),
             FadeIn(encoder_rect),
             Write(encoder_label),
             Write(encoder_title),
@@ -168,16 +135,13 @@ class MAEArchitecture(Scene):
         )
         self.wait(1)
         
-        # Clean up temporary animated groups, arrows, and labels
+        # Transition to decoder section
         self.play(
-            FadeOut(VGroup(arrow1, arrow2, arrow3, arrow_to_encoder, patch_label, mask_label)),
-            FadeOut(animated_input_to_patches), # Just in case it lingered
-            FadeOut(animated_patches_to_mask), # Just in case it lingered
-            FadeOut(animated_patches_to_flatten), # Just in case it lingered
+            FadeOut(VGroup(input_cube, patches_group, arrow1, arrow2, arrow3)),
             run_time=1
         )
         
-        # Transition to decoder section (keep previous objects on screen)
+        # Decoder section title
         decoder_section_title = Text("Decoder", font_size=24, color=PURPLE)
         decoder_section_title.move_to(UP * 2.5)
         self.play(
@@ -323,4 +287,4 @@ class MAEArchitecture(Scene):
             FadeOut(title),
             run_time=2
         )
-        self.wait(0.5)
+        self.wait(0.5) 

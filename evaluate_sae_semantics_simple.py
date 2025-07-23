@@ -113,12 +113,15 @@ def compute_patch_labels_vectorized(mask_batch):
     mask_patches = mask_patches.reshape(B, patches_per_dim**3, patch_size**3)
     
     # Presence-based labeling: check if any voxels of each type are present
-    # mask_patches shape: (B, 1728, 512)
-    
-    # Count occurrences of each label in each patch
     patch_has_membrane = (mask_patches == 1).any(dim=-1)  # (B, 1728)
     patch_has_sphere = (mask_patches == 2).any(dim=-1)    # (B, 1728)
     patch_has_cube = (mask_patches == 3).any(dim=-1)      # (B, 1728)
+    
+    # --- NEW: Purity Analysis ---
+    is_pure_membrane = patch_has_membrane & ~patch_has_sphere & ~patch_has_cube
+    is_pure_sphere = patch_has_sphere & ~patch_has_membrane & ~patch_has_cube
+    is_pure_cube = patch_has_cube & ~patch_has_membrane & ~patch_has_sphere
+    is_background = ~patch_has_membrane & ~patch_has_sphere & ~patch_has_cube
     
     # Create multi-hot encoding (patches can have multiple labels)
     multi_labels = torch.stack([
@@ -137,9 +140,14 @@ def compute_patch_labels_vectorized(mask_batch):
     return {
         'single': single_labels.view(-1),  # (B*1728,) - for backward compatibility
         'multi': multi_labels.view(-1, 3),  # (B*1728, 3) - new multi-hot format
-        'membrane': patch_has_membrane.view(-1),  # (B*1728,) - pure membrane patches
-        'sphere': patch_has_sphere.view(-1),      # (B*1728,) - pure sphere patches  
-        'cube': patch_has_cube.view(-1)           # (B*1728,) - pure cube patches
+        'membrane': patch_has_membrane.view(-1),  # (B*1728,) - presence labels
+        'sphere': patch_has_sphere.view(-1),      
+        'cube': patch_has_cube.view(-1),
+        # --- NEW: Purity labels ---
+        'pure_membrane': is_pure_membrane.view(-1),
+        'pure_sphere': is_pure_sphere.view(-1),
+        'pure_cube': is_pure_cube.view(-1),
+        'background_pure': is_background.view(-1)
     }
 
 def compute_correlations_fast(activations, labels, n_classes=4):
@@ -211,6 +219,57 @@ def compute_correlations_fast(activations, labels, n_classes=4):
         torch.cuda.empty_cache() if torch.cuda.is_available() else None
     
     return correlations
+
+def compute_neuron_selectivity(activations, purity_labels):
+    """
+    Computes mean activation for each neuron on different pure classes and a selectivity score.
+    """
+    n_neurons = activations.shape[1]
+    
+    class_map = {
+        'pure_membrane': 0,
+        'pure_sphere': 1,
+        'pure_cube': 2,
+        'background_pure': 3
+    }
+    
+    mean_acts = torch.zeros(n_neurons, len(class_map), device=activations.device)
+    counts = torch.zeros(len(class_map), device=activations.device)
+
+    for class_name, idx in class_map.items():
+        mask = purity_labels[class_name]
+        count = mask.sum().item()
+        counts[idx] = count
+        if count > 0:
+            mean_acts[:, idx] = activations[mask].mean(dim=0)
+
+    # Calculate selectivity scores
+    selectivity_scores = {}
+    for target_name, target_idx in class_map.items():
+        if target_name == 'background_pure': continue
+
+        target_mean_act = mean_acts[:, target_idx]
+        
+        # Mean activation on all other classes
+        other_mean_act = torch.zeros_like(target_mean_act)
+        total_other_count = 0
+        for other_name, other_idx in class_map.items():
+            if other_idx != target_idx:
+                other_mean_act += mean_acts[:, other_idx] * counts[other_idx]
+                total_other_count += counts[other_idx]
+
+        if total_other_count > 0:
+            other_mean_act /= total_other_count
+        
+        # Selectivity Score = Mean(Target) / (Mean(Others) + epsilon)
+        selectivity = target_mean_act / (other_mean_act + 1e-8)
+        selectivity_scores[target_name] = selectivity
+        
+    return {
+        'mean_activations': mean_acts.cpu(),
+        'counts': counts.cpu(),
+        'selectivity_scores': {k: v.cpu() for k, v in selectivity_scores.items()}
+    }
 
 def compute_shape_correlations(activations, shape_presence_labels, shape_name):
     """Compute correlations for neurons that respond to presence of specific shapes"""
@@ -386,6 +445,8 @@ def main():
                        help="Generate patch visualizations for top semantically selective neurons")
     parser.add_argument("--top_neurons", type=int, default=3, 
                        help="Number of top neurons per class to visualize (only used with --visualize_patches)")
+    parser.add_argument("--neurons_to_visualize", nargs='+', type=int, default=None,
+                       help="A specific list of neuron IDs to visualize")
     
     args = parser.parse_args()
     
@@ -479,6 +540,7 @@ def main():
     all_activations = []
     all_labels = []
     all_shape_labels = {'membrane': [], 'sphere': [], 'cube': []}
+    all_purity_labels = {'pure_membrane': [], 'pure_sphere': [], 'pure_cube': [], 'background_pure': []}
     
     flush_print("Processing volumes...")
     with torch.no_grad():
@@ -515,6 +577,10 @@ def main():
             all_shape_labels['sphere'].append(patch_labels['sphere'].cpu())
             all_shape_labels['cube'].append(patch_labels['cube'].cpu())
             
+            # Store purity labels
+            for name in all_purity_labels:
+                all_purity_labels[name].append(patch_labels[name].cpu())
+            
             # Clear GPU memory
             del vol_batch, mask_batch, tokens, sae_activations
             torch.cuda.empty_cache()
@@ -524,9 +590,11 @@ def main():
     all_activations = torch.cat(all_activations, dim=0)
     all_labels = torch.cat(all_labels, dim=0)
     
-    # Concatenate shape-specific labels
+    # Concatenate shape-specific and purity labels
     for shape_name in all_shape_labels:
         all_shape_labels[shape_name] = torch.cat(all_shape_labels[shape_name], dim=0)
+    for purity_name in all_purity_labels:
+        all_purity_labels[purity_name] = torch.cat(all_purity_labels[purity_name], dim=0)
     
     flush_print(f"Data collected: {all_activations.shape[0]} patches, {all_activations.shape[1]} neurons")
     
@@ -540,8 +608,59 @@ def main():
     label_percentages = 100 * label_counts.float() / total_patches
     class_names = ['Background', 'Membrane', 'Sphere', 'Cube']
     for i, (name, count, pct) in enumerate(zip(class_names, label_counts, label_percentages)):
-        flush_print(f"  {name}: {count} patches ({pct:.1f}%)")
+        flush_print(f"  {name} (Majority Vote): {count} patches ({pct:.1f}%)")
     
+    # --- NEW: Purity Analysis Report ---
+    flush_print("\n=== Neuron Selectivity Analysis (Purity) ===")
+    selectivity_results = compute_neuron_selectivity(all_activations.to(device), {k: v.to(device) for k, v in all_purity_labels.items()})
+
+    # Save the selectivity report
+    report_path = output_dir / 'neuron_selectivity_report.txt'
+    flush_print(f"Saving selectivity report to {report_path}")
+    with open(report_path, 'w') as f:
+        f.write("Neuron Selectivity Report (Based on Mean Activation on Pure Patches)\n")
+        f.write("=" * 65 + "\n\n")
+        f.write(f"Based on {all_activations.shape[0]} patches.\n")
+        
+        counts = selectivity_results['counts']
+        f.write(f"Pure Patch Counts:\n")
+        f.write(f"  - Pure Membrane:   {int(counts[0])}\n")
+        f.write(f"  - Pure Sphere:     {int(counts[1])}\n")
+        f.write(f"  - Pure Cube:       {int(counts[2])}\n")
+        f.write(f"  - Pure Background: {int(counts[3])}\n\n")
+
+        header = f"{'Neuron':>6} | {'MeanAct(Mem)':>13} | {'MeanAct(Sph)':>13} | {'MeanAct(Cube)':>14} | {'MeanAct(BG)':>12} | {'Select(Mem)':>12} | {'Select(Sph)':>12} | {'Select(Cube)':>13}\n"
+        f.write(header)
+        f.write("-" * len(header) + "\n")
+
+        mean_acts = selectivity_results['mean_activations']
+        select_mem = selectivity_results['selectivity_scores']['pure_membrane']
+        select_sph = selectivity_results['selectivity_scores']['pure_sphere']
+        select_cube = selectivity_results['selectivity_scores']['pure_cube']
+
+        # Combine all neurons and sort by max selectivity to see the most monosemantic ones first
+        max_selectivity, _ = torch.stack([select_mem, select_sph, select_cube]).max(dim=0)
+        sorted_indices = torch.argsort(max_selectivity, descending=True)
+
+        for i in range(all_activations.shape[1]):
+            neuron_idx = sorted_indices[i].item()
+            
+            mem_act = mean_acts[neuron_idx, 0].item()
+            sph_act = mean_acts[neuron_idx, 1].item()
+            cube_act = mean_acts[neuron_idx, 2].item()
+            bg_act = mean_acts[neuron_idx, 3].item()
+            mem_sel = select_mem[neuron_idx].item()
+            sph_sel = select_sph[neuron_idx].item()
+            cube_sel = select_cube[neuron_idx].item()
+            
+            # Highlight the most selective class
+            max_s = max(mem_sel, sph_sel, cube_sel)
+            mem_sel_str = f"*{mem_sel:11.2f}" if mem_sel == max_s else f"{mem_sel:12.2f}"
+            sph_sel_str = f"*{sph_sel:11.2f}" if sph_sel == max_s else f"{sph_sel:12.2f}"
+            cube_sel_str = f"*{cube_sel:12.2f}" if cube_sel == max_s else f"{cube_sel:13.2f}"
+
+            f.write(f"{neuron_idx:>6} | {mem_act:>13.4f} | {sph_act:>13.4f} | {cube_act:>14.4f} | {bg_act:>12.4f} | {mem_sel_str} | {sph_sel_str} | {cube_sel_str}\n")
+
     # Fast correlation computation
     semantic_classes = {
         'background': 0,
@@ -780,40 +899,79 @@ def main():
             patch_dir.mkdir(parents=True, exist_ok=True)
             
             total_visualizations = 0
-            
-            # For each class, use the best available analysis method
-            classes_to_process = [
-                ('background', 'background'),
-                ('membrane', 'membrane'), 
-                ('sphere', 'sphere'),
-                ('cube', 'cube')
-            ]
-            
-            for display_name, analysis_key in classes_to_process:
-                # Choose the best available correlation source
-                if analysis_key in all_class_correlations and len(all_class_correlations[analysis_key]) > 0:
-                    correlations_source = all_class_correlations[analysis_key]
-                    source_type = "traditional"
-                elif analysis_key in shape_presence_correlations and len(shape_presence_correlations[analysis_key]) > 0:
-                    correlations_source = shape_presence_correlations[analysis_key]
-                    source_type = "presence-based"
-                else:
-                    flush_print(f"Skipping {display_name}: no correlation data available")
-                    continue
+
+            # --- NEW: Visualize specific neurons if provided ---
+            if args.neurons_to_visualize:
+                flush_print(f"Visualizing specific neurons provided: {args.neurons_to_visualize}")
                 
-                flush_print(f"Processing {display_name} class (using {source_type} analysis)...")
-                
-                # Get top correlated neurons for this class
-                top_neurons = correlations_source[:args.top_neurons]
-                
-                # Generate visualizations for top neurons (clean file names)
-                for i, (neuron_idx, correlation, p_value) in enumerate(top_neurons):
-                    flush_print(f"  Generating patches for {display_name} neuron {neuron_idx} (rank {i+1}, r={correlation:.3f})")
+                selectivity_scores = selectivity_results['selectivity_scores']
+
+                for neuron_idx in args.neurons_to_visualize:
+                    if neuron_idx >= all_activations.shape[1]:
+                        flush_print(f"  Skipping neuron {neuron_idx}: index out of bounds.")
+                        continue
+
+                    # Find best class name for this neuron based on its selectivity score
+                    best_class_name = 'unknown'
+                    max_selectivity = -1.0
+                    
+                    # Determine best class
+                    for class_name, scores in selectivity_scores.items():
+                        score = scores[neuron_idx].item()
+                        if score > max_selectivity:
+                            max_selectivity = score
+                            best_class_name = class_name.replace('pure_', '')
+
+                    flush_print(f"  Generating patches for neuron {neuron_idx} (best class: {best_class_name}, selectivity: {max_selectivity:.2f})")
+                    
+                    corr, p_val = 0.0, 1.0
+                    source = shape_presence_correlations.get(best_class_name, [])
+                    for n_idx, c, p in source:
+                        if n_idx == neuron_idx:
+                            corr, p_val = c, p
+                            break
+
                     visualize_top_activating_patches(
                         volumes, masks, all_activations, all_labels, 
-                        neuron_idx, display_name, correlation, p_value, patch_dir
+                        neuron_idx, f"manual_{best_class_name}", corr, p_val, patch_dir
                     )
                     total_visualizations += 1
+            
+            # --- Original logic for top_neurons ---
+            else:
+                # For each class, use the best available analysis method
+                classes_to_process = [
+                    ('background', 'background'),
+                    ('membrane', 'membrane'), 
+                    ('sphere', 'sphere'),
+                    ('cube', 'cube')
+                ]
+                
+                for display_name, analysis_key in classes_to_process:
+                    # Choose the best available correlation source
+                    if analysis_key in all_class_correlations and len(all_class_correlations[analysis_key]) > 0:
+                        correlations_source = all_class_correlations[analysis_key]
+                        source_type = "traditional"
+                    elif analysis_key in shape_presence_correlations and len(shape_presence_correlations[analysis_key]) > 0:
+                        correlations_source = shape_presence_correlations[analysis_key]
+                        source_type = "presence-based"
+                    else:
+                        flush_print(f"Skipping {display_name}: no correlation data available")
+                        continue
+                    
+                    flush_print(f"Processing {display_name} class (using {source_type} analysis)...")
+                    
+                    # Get top correlated neurons for this class
+                    top_neurons = correlations_source[:args.top_neurons]
+                    
+                    # Generate visualizations for top neurons (clean file names)
+                    for i, (neuron_idx, correlation, p_value) in enumerate(top_neurons):
+                        flush_print(f"  Generating patches for {display_name} neuron {neuron_idx} (rank {i+1}, r={correlation:.3f})")
+                        visualize_top_activating_patches(
+                            volumes, masks, all_activations, all_labels, 
+                            neuron_idx, display_name, correlation, p_value, patch_dir
+                        )
+                        total_visualizations += 1
             
             # Create a summary file with neuron information
             summary_file = patch_dir / "neuron_summary.txt"
@@ -856,6 +1014,7 @@ def main():
         flush_print("  - top_neurons_comparison.png: Top neurons across all classes")
         flush_print("  - presence_vs_majority_comparison.png: Shape presence vs majority vote analysis")
         flush_print("  - all_class_results.txt: Detailed results for traditional AND presence-based analysis")
+        flush_print("  - neuron_selectivity_report.txt: NEW report on mean activations on PURE patches")
         if args.visualize_patches:
             flush_print("  - patch_visualizations/: Individual neuron activation patches")
             flush_print(f"    * Generated {total_visualizations} patch visualization files")
@@ -866,6 +1025,7 @@ def main():
     flush_print(f"\n=== Directory Structure ===")
     flush_print(f"Base: {base_output_dir}")
     flush_print(f"Checkpoint-specific: checkpoints/{checkpoint_name}/")
+    flush_print(f"NEW Selectivity Report: checkpoints/{checkpoint_name}/neuron_selectivity_report.txt")
     flush_print("=== Analysis complete! ===")
 
 if __name__ == "__main__":

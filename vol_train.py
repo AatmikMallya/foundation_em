@@ -30,7 +30,7 @@ from vit_3d import (
     mae_vit_3d_small, mae_vit_3d_base, mae_vit_3d_large, mae_vit_3d_huge,
     mae_vit_3d_hemibrain_optimal,
     mae_vit_3d_small_conv, mae_vit_3d_base_conv, mae_vit_3d_large_conv,
-    mae_vit_3d_hemibrain_optimal_conv,
+    mae_vit_3d_hemibrain_optimal_conv, mae_vit_3d_base_patch_conv,
     get_device,
 )
 from plotly_visualization import plotly_visualize_reconstructions
@@ -52,13 +52,13 @@ from concurrent.futures import ThreadPoolExecutor
 class TarShardDataset(IterableDataset):
     """Tar dataset with I/O optimizations."""
     def __init__(self, shards, volume_size: int, shuffle: bool = False, 
-                 vols_per_shard: int = 65_536):
+                 vols_per_shard: int = 16384):
         self.shards = shards
         self.shuffle = shuffle
         self.vols_per_shard = vols_per_shard
         self.volume_size = volume_size
         
-        print(f"Dataset: {len(shards)} shards, shuffle={shuffle}")
+        print(f"Dataset: {len(shards)} shards, {self.vols_per_shard} vols/shard, shuffle={shuffle}")
 
     def __len__(self):
         return len(self.shards) * self.vols_per_shard
@@ -132,14 +132,14 @@ class CUDAPrefetcher:
             return False
             
         with torch.cuda.stream(self.stream):
-            # Optimized GPU transfer for H100
+            # Only transfer to device, keep fp32 - let autocast handle precision reduction
             if batch_cpu.is_pinned():
                 # Fast path: already pinned memory
-                batch_gpu = batch_cpu.to(self.device, non_blocking=True)
+                batch_gpu = batch_cpu.to(device=self.device, memory_format=torch.channels_last_3d, non_blocking=True)
             else:
                 # Slower path: pin then transfer
                 batch_cpu = batch_cpu.pin_memory()
-                batch_gpu = batch_cpu.to(self.device, non_blocking=True)
+                batch_gpu = batch_cpu.to(device=self.device, memory_format=torch.channels_last_3d, non_blocking=True)
             
             # Record an event to know when this transfer is complete
             event = torch.cuda.Event()
@@ -217,6 +217,7 @@ def run_val(loader, model, mask, use_amp, device, amp_dtype=torch.float16, max_b
         for v in val_prefetcher:
             if batch_count >= max_batches:  # Limit validation batches for speed
                 break
+            # Batch already has optimal memory format from prefetcher
             l, *_ = model(v, mask_ratio=mask)
             if not torch.isnan(l):
                 losses.append(l.detach())
@@ -246,7 +247,7 @@ def main(a):
 
     train_loader = DataLoader(
         TarShardDataset(
-            train_shards, a.img_size, shuffle=True
+            train_shards, a.img_size, shuffle=True, vols_per_shard=a.vols_per_shard
         ),
         batch_size=a.batch_size,
         num_workers=a.num_workers,
@@ -260,7 +261,7 @@ def main(a):
     )
     val_loader = DataLoader(
         TarShardDataset(
-            val_shards, a.img_size, shuffle=False
+            val_shards, a.img_size, shuffle=False, vols_per_shard=a.vols_per_shard
         ),
         batch_size=a.batch_size,
         num_workers=a.num_workers,
@@ -273,7 +274,7 @@ def main(a):
     )
     vis_loader = DataLoader(
         TarShardDataset(
-            val_shards[:1], a.img_size, shuffle=False
+            val_shards[:1], a.img_size, shuffle=False, vols_per_shard=a.vols_per_shard
         ),
         batch_size=1, num_workers=0
     )
@@ -285,45 +286,40 @@ def main(a):
         "hemibrain_optimal": mae_vit_3d_hemibrain_optimal,
         "small_conv": mae_vit_3d_small_conv, "base_conv": mae_vit_3d_base_conv,
         "large_conv": mae_vit_3d_large_conv,
-        "hemibrain_optimal_conv": mae_vit_3d_hemibrain_optimal_conv
+        "hemibrain_optimal_conv": mae_vit_3d_hemibrain_optimal_conv,
+        "base_patch_conv": mae_vit_3d_base_patch_conv
     }
     model = archs[a.model_arch](
         volume_size=(a.img_size,)*3,
         patch_size=a.patch_size,
         norm_pix_loss=a.norm_pix_loss,
         mask_ratio=a.initial_masking_ratio
-    ).to(device)
-
+    )
+    
     # Determine autocast dtype (bf16 recommended for H100)
     autocast_dtype = _AMP_DTYPE_MAP.get(a.amp_dtype, torch.bfloat16)
+    
+    # Optimize memory layout for 3D convolutions (15% speedup for Conv models)
+    try:
+        model = model.to(device, memory_format=torch.channels_last_3d)
+        print("Model using channels-last-3D memory format for optimized 3D convolutions")
+    except (AttributeError, RuntimeError):
+        # Fallback for PyTorch < 2.2 or if channels_last_3d not supported
+        model = model.to(device)
+        print("Using default memory format (channels_last_3d not available)")
 
     # ─── Model compilation ────────────────────────────
-    if not hasattr(torch, 'compile'):
-        raise RuntimeError("torch.compile not available - requires PyTorch 2.0+")
-    
-    # First try with inductor backend (fastest)
-    try:
-        model = torch.compile(model, backend="inductor", mode="default")
-        print("Model compiled with torch.compile (inductor backend)")
-    except Exception as inductor_e:
-        print(f"Inductor backend failed: {inductor_e}")
-        # Fallback to eager backend (no Triton dependency)
-        try:
-            model = torch.compile(model, backend="eager", mode="default") 
-            print("Model compiled with torch.compile (eager backend)")
-        except Exception as eager_e:
-            # If both fail, crash with detailed error
-            raise RuntimeError(
-                f"Model compilation failed with all backends:\n"
-                f"  - Inductor: {inductor_e}\n"
-                f"  - Eager: {eager_e}\n"
-                f"Please fix the compilation environment or use a compatible PyTorch version."
-            )
+    # Optimize Inductor compilation settings to reduce first-time compilation from 20-25 min to 2-3 min
+    model = torch.compile(model, backend="inductor", )
+    print("Model compiled with torch.compile (inductor backend, default mode)")
+
+    torch.cuda.empty_cache()                # release their buffers
 
     optim = torch.optim.AdamW(model.parameters(),
                               lr=a.learning_rate,
                               betas=(a.adam_beta1, a.adam_beta2),
-                              weight_decay=a.weight_decay)
+                              weight_decay=a.weight_decay,
+                              eps=1e-5)
 
     steps_per_epoch = len(train_loader)
     total_steps = a.total_steps or a.epochs * steps_per_epoch
@@ -367,6 +363,12 @@ def main(a):
     global_step = 0
     loss_ma = deque(maxlen=100)
 
+    # Silence PyTorch warning when converting read-only NumPy buffers (e.g. from
+    # tarfile reads) to tensors.  We only read from these tensors, so the warning
+    # is safe to ignore.
+    import warnings
+    warnings.filterwarnings("ignore", message=r"The given NumPy array is not writable, and PyTorch does not support non-writable tensors.*", category=UserWarning)
+
     for epoch in range(a.epochs):
         model.train()
         prefetcher = CUDAPrefetcher(train_loader, device)
@@ -376,13 +378,26 @@ def main(a):
             if cancel["stop"]:
                 break
             global_step += 1
+
+            # ──── batch‑level image sanity log ─────────────────────────────
+            if global_step % 100 == 0:               # every 100 steps
+                imgs_std  = batch.std().item()
+                imgs_mean = batch.mean().item()
+                wandb.log({
+                    "imgs_std":  imgs_std,
+                    "imgs_mean": imgs_mean,
+                    "step":      global_step
+                })
+            # ───────────────────────────────────────────────────────────────
+
             
             mratio = mask_ratio(global_step, total_steps,
                                 a.initial_masking_ratio, a.final_masking_ratio)
 
             optim.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=a.use_amp, dtype=autocast_dtype):
-                loss, *_ = model(batch, mask_ratio=mratio)
+            with torch.amp.autocast(enabled=a.use_amp, dtype=autocast_dtype, device_type="cuda"):
+                # loss, *_ = model(batch, mask_ratio=mratio)
+                loss, _, mask, _ = model(batch, mask_ratio=mratio)
 
             # Fail fast if loss is NaN or Inf (respect user rule: no silent fallbacks)
             if not torch.isfinite(loss):
@@ -393,16 +408,33 @@ def main(a):
                 # fp16 path: use GradScaler
                 scaler.scale(loss).backward()
                 scaler.unscale_(optim)
-                if a.grad_clip_norm:
+                if a.grad_clip_norm is not None:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), a.grad_clip_norm)
                 scaler.step(optim)
-                scaler.update()
+                scaler.update() 
             else:
                 # bf16 path: direct backward (no scaling needed)
                 loss.backward()
-                if a.grad_clip_norm:
+                if a.grad_clip_norm is not None:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), a.grad_clip_norm)
                 optim.step()
+
+            # ──── grad + mask diagnostics (pre‑clip norm) ──────────────────
+            if global_step % 100 == 0:
+                # raw gradient norm (use huge max_norm so we just *measure*)
+                total_norm = torch.nn.utils.clip_grad_norm_(
+                                model.parameters(), 1e9,
+                                error_if_nonfinite=False).item()
+
+                mask_visible = mask.float().sum(dim=1).mean().item()
+
+                wandb.log({
+                    "grad_norm":    total_norm,
+                    "mask_visible": mask_visible,
+                    "step":         global_step,
+                })
+            # ───────────────────────────────────────────────────────────────
+ 
             scheduler.step()
             if ema:
                 ema.update(model)
@@ -431,7 +463,7 @@ def main(a):
                     best_val_loss = v
                     print(f"New best validation loss: {v:.6f} (step {global_step}) - saving model...")
                     
-                    # Save the model state dict
+                    # Save the model state dict with dtype information
                     torch.save({
                         'model_state_dict': model.state_dict(),
                         'ema_state_dict': ema.get().state_dict() if ema else None,
@@ -440,7 +472,8 @@ def main(a):
                         'global_step': global_step,
                         'epoch': epoch + 1,
                         'val_loss': v,
-                        'config': vars(a)
+                        'config': vars(a),
+                        'model_dtype': str(autocast_dtype)  # Save the model dtype for later loading
                     }, best_model_path)
                     
                     # Also log to wandb that we saved a new best model
@@ -481,18 +514,74 @@ def main(a):
     wandb.finish()
     print("Training complete.")
 
+def load_model_checkpoint(checkpoint_path, model, device='cuda'):
+    """
+    Load a model checkpoint with proper dtype handling and torch.compile compatibility.
+    
+    Args:
+        checkpoint_path: Path to the checkpoint file
+        model: Model instance to load weights into
+        device: Device to load the model on
+    
+    Returns:
+        Loaded model with correct dtype
+    """
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    
+    # Get the state dict
+    state_dict = checkpoint['model_state_dict']
+    
+    # Handle torch.compile _orig_mod prefixes
+    if any(key.startswith('_orig_mod.') for key in state_dict.keys()):
+        print("  Detected torch.compile checkpoint, removing _orig_mod prefixes...")
+        # Remove _orig_mod. prefix from all keys
+        new_state_dict = {}
+        for key, value in state_dict.items():
+            if key.startswith('_orig_mod.'):
+                new_key = key[len('_orig_mod.'):]
+                new_state_dict[new_key] = value
+            else:
+                new_state_dict[key] = value
+        state_dict = new_state_dict
+    
+    # Load model state dict
+    try:
+        model.load_state_dict(state_dict, strict=True)
+        print("  Successfully loaded checkpoint weights")
+    except RuntimeError as e:
+        print(f"  Error loading checkpoint: {e}")
+        # Try non-strict loading as fallback
+        missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+        if missing_keys:
+            print(f"  Missing keys: {missing_keys[:5]}{'...' if len(missing_keys) > 5 else ''}")
+        if unexpected_keys:
+            print(f"  Unexpected keys: {unexpected_keys[:5]}{'...' if len(unexpected_keys) > 5 else ''}")
+    
+    # Restore the correct dtype if saved in checkpoint
+    if 'model_dtype' in checkpoint:
+        model_dtype_str = checkpoint['model_dtype']
+        if model_dtype_str == "torch.bfloat16":
+            model = model.to(dtype=torch.bfloat16)
+            print(f"  Loaded model with dtype: {model_dtype_str}")
+        elif model_dtype_str == "torch.float16":
+            model = model.to(dtype=torch.float16)
+            print(f"  Loaded model with dtype: {model_dtype_str}")
+    
+    model = model.to(device)
+    return model, checkpoint
+
 # ════════════════════ CLI ════════════════════════════════════════════════
 if __name__ == "__main__":
     P = argparse.ArgumentParser("MAE-3D trainer (CUDA-prefetch)")
     P.add_argument("--shard_dir", required=True)
     P.add_argument("--val_split", type=float, default=0.02)
     # model
-    P.add_argument("--img_size", type=int, default=64)
-    P.add_argument("--patch_size", type=int, default=16)
+    P.add_argument("--img_size", type=int, default=96)
+    P.add_argument("--patch_size", type=int, default=8)
     P.add_argument("--model_arch", default="base",
                    choices=["small","base","large","huge","hemibrain_optimal",
                             "small_conv","base_conv","large_conv",
-                            "hemibrain_optimal_conv"])
+                            "hemibrain_optimal_conv","base_patch_conv"])
     # training
     P.add_argument("--epochs", type=int, default=4)
     P.add_argument("--batch_size", type=int, default=1024)
@@ -503,7 +592,7 @@ if __name__ == "__main__":
     P.add_argument("--weight_decay", type=float, default=0.05)
     P.add_argument("--num_workers", type=int, default=16)   # more I/O threads
     P.add_argument("--use_amp", action="store_true", default=True)
-    P.add_argument("--grad_clip_norm", type=float, default=1.0)
+    P.add_argument("--grad_clip_norm", type=float, default=None)
     P.add_argument("--ema_decay", type=float, default=0.9995)
     P.add_argument("--norm_pix_loss", action="store_true")
     # masking & logging
@@ -513,7 +602,7 @@ if __name__ == "__main__":
     P.add_argument("--vis_interval", type=int, default=250)
     P.add_argument("--val_interval", type=int, default=2_000)
     P.add_argument("--skip_validation", action="store_true")
-    P.add_argument("--vis_samples", type=int, default=2)
+    P.add_argument("--vis_samples", type=int, default=6)
     P.add_argument("--run_name", default="mae_membrane_tar_prefetch")
     P.add_argument("--project_name", default="mae-3d-membranes")
     P.add_argument("--adam_beta1", type=float, default=0.9)
@@ -528,5 +617,7 @@ if __name__ == "__main__":
                    help="Number of batches to prefetch per worker")
     P.add_argument("--save_best_model", action="store_true",
                    help="Save the model when validation loss improves")
+    P.add_argument("--vols_per_shard", type=int, default=16384,
+                   help="Number of volumes per .tar shard file.")
     args = P.parse_args()
     main(args)

@@ -19,3 +19,10 @@ pyvoro_out/
 media/
 images/
 *.png
+*.html
+.cursor/
+CLAUDE.md
+~/
+analysis_results/
+wandb/
+enhanced_visualizations/

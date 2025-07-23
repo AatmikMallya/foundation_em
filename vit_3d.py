@@ -117,7 +117,7 @@ class Block(nn.Module):
 class PatchEmbed3D(nn.Module):
     """ 3D Image to Patch Embedding
     """
-    def __init__(self, volume_size=(64, 64, 64), patch_size=(8, 8, 8), in_chans=1, embed_dim=768):
+    def __init__(self, volume_size=(96, 96, 96), patch_size=(8, 8, 8), in_chans=1, embed_dim=768):
         super().__init__()
         volume_size = to_3tuple(volume_size)
         patch_size = to_3tuple(patch_size)
@@ -134,6 +134,47 @@ class PatchEmbed3D(nn.Module):
             f"Input image size ({D},{H},{W}) doesn't match model ({self.volume_size[0]},{self.volume_size[1]},{self.volume_size[2]})."
         x = self.proj(x).flatten(2).transpose(1, 2) # B, C, Dp, Hp, Wp -> B, C, Np -> B, Np, C
         return x
+
+class ConvPatchEmbed3D(nn.Module):
+    """
+    Vectorized 3D Convolutional Patch Embedding for translation-invariant representations.
+    
+    Processes the entire volume at once instead of patch-by-patch for dramatic speedup.
+    Architecture: 96³ → stem(48³) → downsample(24³) → down(12³) → proj(768ch)
+    """
+    def __init__(self, volume_size=(96, 96, 96), patch_size=(8, 8, 8), in_chans=1, embed_dim=768):
+        super().__init__()
+        volume_size = to_3tuple(volume_size)
+        patch_size = to_3tuple(patch_size)
+        self.volume_size = volume_size
+        self.patch_size = patch_size
+        self.grid_size = (volume_size[0] // patch_size[0], volume_size[1] // patch_size[1], volume_size[2] // patch_size[2])
+        self.num_patches = self.grid_size[0] * self.grid_size[1] * self.grid_size[2]
+        
+        # 96³ → 48³ → 24³ (2 small convs with stride=2)
+        self.stem = nn.Sequential(
+            nn.Conv3d(in_chans, 32, 3, stride=2, padding=1),
+            nn.GELU(),
+            nn.Conv3d(32, 64, 3, stride=2, padding=1),
+            nn.GELU(),
+        )
+        # Pool so that feature map matches grid size (24 / 8 = 3, we need 12)
+        # 24³ → 12³ by strided avg-pool
+        self.down = nn.AvgPool3d(kernel_size=2, stride=2)
+
+        # pointwise conv to get the final embedding dim
+        self.proj = nn.Conv3d(64, embed_dim, 1)
+
+    def forward(self, x):
+        B, C, D, H, W = x.shape
+        assert D == self.volume_size[0] and H == self.volume_size[1] and W == self.volume_size[2], \
+            f"Input image size ({D},{H},{W}) doesn't match model ({self.volume_size[0]},{self.volume_size[1]},{self.volume_size[2]})."
+                
+        x = self.stem(x)          # (B,96,24,24,24)
+        x = self.down(x)          # (B,96,12,12,12)
+        x = self.proj(x)          # (B,768,12,12,12)
+        B, C, D, H, W = x.shape   # D=H=W=12
+        return x.permute(0, 2, 3, 4, 1).reshape(B, -1, C)  # (B,1728,embed_dim)
 
 def get_sinusoid_encoding_table_3d(num_patches: int, embed_dim: int):
     """Axis-concatenated 3-D sine–cosine positional encoding.
@@ -198,17 +239,21 @@ def get_sinusoid_encoding_table_3d(num_patches: int, embed_dim: int):
 
 class ViT3D(nn.Module):
     """ Vision Transformer for 3D data """
-    def __init__(self, volume_size=(64,64,64), patch_size=(8,8,8), in_chans=1, num_classes=0, # num_classes=0 for MAE encoder
+    def __init__(self, volume_size=(96,96,96), patch_size=(8,8,8), in_chans=1, num_classes=0, # num_classes=0 for MAE encoder
                  embed_dim=768, depth=12, num_heads=12, mlp_ratio=4., qkv_bias=True, 
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0., norm_layer=None,
-                 global_pool=False):
+                 global_pool=False, patch_embed_class=None):
         super().__init__()
         self.num_classes = num_classes
         self.embed_dim = embed_dim
         self.global_pool = global_pool
         self.patch_size = to_3tuple(patch_size)
 
-        self.patch_embed = PatchEmbed3D(volume_size, self.patch_size, in_chans, embed_dim)
+        # Use custom patch embedding class if provided, otherwise use default
+        if patch_embed_class is None:
+            patch_embed_class = PatchEmbed3D
+        
+        self.patch_embed = patch_embed_class(volume_size, self.patch_size, in_chans, embed_dim)
         num_patches = self.patch_embed.num_patches
 
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
@@ -370,11 +415,11 @@ class ConvNeck3D(nn.Module):
 class MaskedAutoencoderViT3D(nn.Module):
     """ Masked Autoencoder with VisionTransformer backbone for 3D volumes """
 
-    def __init__(self, volume_size=(64,64,64), patch_size=(8,8,8), in_chans=1,
+    def __init__(self, volume_size=(96,96,96), patch_size=(8,8,8), in_chans=1,
                  embed_dim=768, depth=12, num_heads=12,
                  decoder_embed_dim=512, decoder_depth=8, decoder_num_heads=16,
                  mlp_ratio=4., norm_layer=nn.LayerNorm, norm_pix_loss=False, mask_ratio=0.75,
-                 decoder_neck="linear"):
+                 decoder_neck="linear", patch_embed_class=None):
         super().__init__()
 
         self.volume_size = volume_size
@@ -386,7 +431,7 @@ class MaskedAutoencoderViT3D(nn.Module):
         self.encoder = ViT3D(
             volume_size=volume_size, patch_size=patch_size, in_chans=in_chans,
             embed_dim=embed_dim, depth=depth, num_heads=num_heads, mlp_ratio=mlp_ratio,
-            norm_layer=norm_layer
+            norm_layer=norm_layer, patch_embed_class=patch_embed_class
         )
 
         # --------------------------------------------------------------------------
@@ -536,7 +581,7 @@ class MaskedAutoencoderViT3D(nn.Module):
         
         return x, mask, ids_restore
 
-    def forward_decoder(self, x, ids_restore):
+    def forward_decoder(self, x, ids_restore=None):
         if check_nan(x, "decoder_input", "forward_decoder"):
             return x
         
@@ -544,7 +589,9 @@ class MaskedAutoencoderViT3D(nn.Module):
         if check_nan(x, "decoder_embed", "forward_decoder"):
             return x
         
-        mask_tokens = self.mask_token.repeat(x.shape[0], ids_restore.shape[1] + 1 - x.shape[1], 1)
+        # If we have restore IDs, we need to un-shuffle and add mask tokens
+        if ids_restore is not None:
+            mask_tokens = self.mask_token.repeat(x.shape[0], ids_restore.shape[1] + 1 - x.shape[1], 1)
         if check_nan(mask_tokens, "mask_tokens", "forward_decoder"):
             return x
         
@@ -569,6 +616,7 @@ class MaskedAutoencoderViT3D(nn.Module):
         if check_nan(x, "x_prepend_cls", "forward_decoder"):
             return x
         
+        # Add positional embedding
         x = x + self.decoder_pos_embed
         if check_nan(x, "decoder_pos_embed_added", "forward_decoder"):
             return x
@@ -645,13 +693,14 @@ class MaskedAutoencoderViT3D(nn.Module):
         if check_nan(mask_sum, "mask_sum", "forward_loss"):
             return torch.tensor(0.0, device=imgs.device), patch_stats
             
-        if mask_sum == 0:
-            # If no patches are masked, return zero loss
-            loss = torch.tensor(0.0, device=imgs.device, dtype=loss.dtype)
-        else:
-            loss = (loss * mask).sum() / mask_sum
-            if check_nan(loss, "final_loss", "forward_loss"):
-                return torch.tensor(0.0, device=imgs.device), patch_stats
+        # Use torch.where to avoid dynamic control flow (compilation-friendly)
+        # If mask_sum == 0, return zero loss; otherwise compute the masked loss
+        zero_loss = torch.tensor(0.0, device=imgs.device, dtype=loss.dtype)
+        masked_loss = (loss * mask).sum() / torch.clamp(mask_sum, min=1e-8)  # Clamp to avoid division by zero
+        loss = torch.where(mask_sum == 0, zero_loss, masked_loss)
+        
+        if check_nan(loss, "final_loss", "forward_loss"):
+            return torch.tensor(0.0, device=imgs.device), patch_stats
              
         return loss, patch_stats
 
@@ -661,10 +710,12 @@ class MaskedAutoencoderViT3D(nn.Module):
             
         latent, mask, ids_restore = self.forward_encoder(imgs, mask_ratio if mask_ratio is not None else self.mask_ratio)
         if latent is None or mask is None or ids_restore is None:
+            # This can happen if NaN checking is on and finds an issue
             return torch.tensor(0.0, device=imgs.device), None, None, None
             
         pred = self.forward_decoder(latent, ids_restore)
         if pred is None:
+            # This can happen if NaN checking is on and finds an issue
             return torch.tensor(0.0, device=imgs.device), None, mask, None
             
         loss, patch_stats = self.forward_loss(imgs, pred, mask)
@@ -739,6 +790,15 @@ def mae_vit_3d_base_conv(**kwargs):
 def mae_vit_3d_large_conv(**kwargs):
     """MAE ViT-3D Large with ConvNeck3D decoder."""
     return mae_vit_3d_large(decoder_neck="conv", **kwargs)
+
+def mae_vit_3d_base_patch_conv(**kwargs):
+    """MAE ViT-3D Base with ConvPatchEmbed3D for translation-invariant patch embedding."""
+    model = MaskedAutoencoderViT3D(
+        embed_dim=768, depth=12, num_heads=12,
+        decoder_embed_dim=512, decoder_depth=8, decoder_num_heads=16,
+        mlp_ratio=4, patch_embed_class=ConvPatchEmbed3D, **kwargs
+    )
+    return model
 
 def mae_vit_3d_hemibrain_optimal_conv(**kwargs):
     """MAE ViT-3D Hemibrain Optimal with ConvNeck3D decoder."""

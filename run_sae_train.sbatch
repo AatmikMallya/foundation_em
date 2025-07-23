@@ -5,48 +5,55 @@
 #SBATCH --error=logs/train_sae_%j.err
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=32
-#SBATCH --mem-per-cpu=10G
-#SBATCH --time=1-00:00:00
+#SBATCH --cpus-per-task=16
+#SBATCH --mem-per-cpu=6G
+#SBATCH --time=18:00:00
 #SBATCH --partition=gpu
 #SBATCH --gpus=h100:1
 #SBATCH --signal=TERM@120
 
 mkdir -p logs
 module purge
-module load PyTorch/2.1.2-foss-2022b-CUDA-12.1.1
+module load Python/3.10.8-GCCcore-12.2.0-bare
+module load CUDA/12.6.3
 
 source venv/bin/activate
 
-# Tune for I/O throughput
+# Let Torch choose more pinned‑mem buffers for DALI‑like throughput
+export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:256
+# Avoid each worker spawning too many OpenMP threads
+export OMP_NUM_THREADS=1
+# Faster NCCL peer‑direct on Hopper/H200
+export NCCL_NET_GDR_LEVEL=PHB
+# Optimize environment for I/O performance
 export CUDA_LAUNCH_BLOCKING=0
-export RUN_NAME="base_layer8_lat4_k32_lr1e-3"
 
+export RUN_NAME="base_patch_conv_patchembed_easy"
 
 python3 sae_train.py \
     --project_name "sae-3d-vol" \
     --run_name $RUN_NAME \
     --shard_dir /gpfs/radev/home/am3833/scratch/volumes_96 \
-    --checkpoint checkpoints/best_model_mask_75_v2.pt \
+    --checkpoint checkpoints/best_model_base_patch_conv_v4_85_stable_eps1e-5.pt \
     --output_path checkpoints/sae/$RUN_NAME.pt \
-    --model_arch base \
+    --model_arch base_patch_conv \
     --img_size 96 \
     --patch_size 8 \
     --extract_from encoder \
-    --layer 8 \
-    --latent_dim_multiplier 4 \
-    --k_sparse 32 \
-    --l1_coeff 1e-6 \
+    --layer 2 \
+    --latent_dim_multiplier 8 \
+    --l1_coeff 0.0 \
+    --ortho_coeff 0.0 \
     --batch_size 128 \
-    --learning_rate 1e-3 \
+    --learning_rate 1.5e-3 \
     --total_steps 10000 \
     --use_cosine_decay \
     --warmup_steps 500 \
     --activation relu \
-    --num_workers 32 \
+    --num_workers 16 \
     --prefetch_factor 4 \
     --val_interval 500 \
-    --val_split 0.02 \
+    --val_split 0.01 \
     --save_best_model \
     --use_amp \
     --amp_dtype bf16 \
@@ -55,8 +62,11 @@ python3 sae_train.py \
     --dead_threshold 12500 \
     --resample_interval 25000 \
     --sae_variant linear \
-    --compile_sae \
     --compile_mae \
-
+    --compile_sae \
+    --vis_interval 1000 \
+    --vis_samples 6
+# --k_sparse 4 \
     
- 
+
+
